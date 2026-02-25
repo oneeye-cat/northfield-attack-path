@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Northfield Manufacturing — Attack Path Analysis</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root {
+    --bg: #f5f7fa;
+    --panel: #ffffff;
+    --border: #d3dae6;
+    --critical: #bd271e;
+    --high: #b36a00;
+    --medium: #017d73;
+    --low: #006bb4;
+    --exfil: #6b3fa0;
+    --lateral: #bd271e;
+    --credential: #b36a00;
+    --data: #017d73;
+    --text: #49526a;
+    --text-bright: #1a1c21;
+    --text-muted: #98a2b3;
+    --grid: rgba(105,112,125,0.06);
+    --accent: #006bb4;
+    --choke: #6b3fa0;
+    --header: #1a1c21;
+    --shadow: 0 2px 8px rgba(0,0,0,0.08);
+    --shadow-lg: 0 4px 20px rgba(0,0,0,0.12);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    font-family: 'Inter', sans-serif;
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 32px 32px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  header {
+    position: relative;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 24px;
+    height: 48px;
+    background: var(--header);
+    flex-shrink: 0;
+  }
+
+  .logo { display: flex; align-items: center; gap: 10px; }
+
+  .logo-mark {
+    width: 26px; height: 26px;
+    background: var(--critical);
+    border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  .logo-mark svg { width: 14px; height: 14px; fill: white; }
+
+  h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.02em; color: #fff; }
+  h1 span { color: #ff6b6b; }
+
+  .header-right { display: flex; align-items: center; gap: 16px; }
+
+  .status-pill {
+    display: flex; align-items: center; gap: 6px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 20px; padding: 4px 10px;
+    font-size: 11px; font-family: 'JetBrains Mono', monospace;
+    color: rgba(255,255,255,0.7);
+  }
+
+  .status-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #6dccb1; animation: blink 2s infinite;
+  }
+  .status-dot.error { background: var(--critical); }
+
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+  .header-time { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: rgba(255,255,255,0.35); }
+
+  .filter-bar {
+    position: relative; z-index: 9;
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .filter-label {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--text-muted); margin-right: 2px;
+  }
+
+  .filter-btn {
+    display: flex; align-items: center; gap: 5px;
+    padding: 4px 10px; border-radius: 16px;
+    border: 1px solid var(--border); background: transparent;
+    font-size: 12px; font-family: 'Inter', sans-serif; font-weight: 500;
+    color: var(--text); cursor: pointer; transition: all 0.15s;
+  }
+  .filter-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .filter-btn.active { color: white; border-color: transparent; }
+  .filter-btn.active.all { background: var(--text-bright); }
+  .filter-btn.active.lateral { background: var(--lateral); }
+  .filter-btn.active.credential { background: #f5a700; color: #1a1c21; }
+  .filter-btn.active.data { background: var(--data); }
+  .filter-btn.active.exfil { background: var(--exfil); }
+
+  .filter-dot { width: 7px; height: 7px; border-radius: 50%; }
+  .sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+
+  .choke-toggle {
+    margin-left: auto; display: flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 500; color: var(--choke); cursor: pointer;
+    padding: 4px 10px; border: 1px solid rgba(107,63,160,0.3); border-radius: 16px;
+    background: rgba(107,63,160,0.05); transition: all 0.15s; font-family: 'Inter', sans-serif;
+  }
+  .choke-toggle:hover { background: rgba(107,63,160,0.12); }
+  .choke-toggle.active { background: rgba(107,63,160,0.15); }
+
+  .main { display: flex; flex: 1; overflow: hidden; position: relative; z-index: 1; }
+
+  #graph { flex: 1; position: relative; overflow: hidden; }
+  svg { width: 100%; height: 100%; }
+
+  @keyframes dash { to { stroke-dashoffset: -20; } }
+  .edge-flow { stroke-dasharray: 6 4; animation: dash 0.9s linear infinite; }
+
+  .sidebar {
+    width: 300px; background: var(--panel);
+    border-left: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0;
+  }
+
+  .sidebar-section { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+
+  .sidebar-title {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--text-muted); margin-bottom: 10px;
+  }
+
+  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+
+  .stat-card {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 12px;
+    position: relative; overflow: hidden;
+  }
+  .stat-card::after {
+    content: ''; position: absolute;
+    left: 0; top: 0; bottom: 0; width: 3px; border-radius: 6px 0 0 6px;
+  }
+  .stat-card.c1::after { background: var(--critical); }
+  .stat-card.c2::after { background: #f5a700; }
+  .stat-card.c3::after { background: var(--exfil); }
+  .stat-card.c4::after { background: var(--choke); }
+
+  .stat-value {
+    font-size: 26px; font-weight: 700;
+    font-family: 'JetBrains Mono', monospace; line-height: 1; margin-bottom: 3px;
+  }
+  .stat-card.c1 .stat-value { color: var(--critical); }
+  .stat-card.c2 .stat-value { color: #f5a700; }
+  .stat-card.c3 .stat-value { color: var(--exfil); }
+  .stat-card.c4 .stat-value { color: var(--choke); }
+
+  .stat-label { font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+
+  .legend-grid { display: flex; flex-direction: column; gap: 7px; }
+  .legend-row { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 500; color: var(--text); }
+  .legend-swatch { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .legend-line { width: 20px; height: 2px; flex-shrink: 0; border-radius: 1px; }
+
+  .detail-panel { flex: 1; overflow-y: auto; padding: 14px 16px; }
+
+  .detail-empty {
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; height: 100px; gap: 8px;
+    color: var(--text-muted); font-size: 12px; text-align: center;
+  }
+
+  .detail-hostname {
+    font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 500;
+    color: var(--text-bright); margin-bottom: 2px; word-break: break-all;
+  }
+  .detail-type-label {
+    font-size: 10px; font-weight: 600; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--text-muted); margin-bottom: 12px; display: block;
+  }
+  .detail-fields { display: flex; flex-direction: column; gap: 0; margin-bottom: 14px; }
+  .detail-field {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 7px 0; border-bottom: 1px solid rgba(0,0,0,0.05); font-size: 12px;
+  }
+  .detail-field-label { color: var(--text-muted); font-size: 11px; font-weight: 500; }
+  .detail-field-value { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-bright); }
+
+  .badge {
+    display: inline-flex; align-items: center;
+    padding: 2px 8px; border-radius: 10px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  .badge.critical { background: rgba(189,39,30,0.1); color: var(--critical); }
+  .badge.high { background: rgba(245,167,0,0.15); color: #8a6300; }
+  .badge.medium { background: rgba(1,125,115,0.1); color: var(--medium); }
+  .badge.low { background: rgba(0,107,180,0.1); color: var(--low); }
+  .badge.yes { background: rgba(189,39,30,0.1); color: var(--critical); }
+  .badge.no { background: rgba(1,125,115,0.1); color: var(--medium); }
+  .badge.choke { background: rgba(107,63,160,0.1); color: var(--choke); }
+
+  .vuln-header {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--text-muted);
+    display: flex; align-items: center; gap: 6px; margin-bottom: 8px;
+  }
+  .vuln-count { background: var(--exfil); color: white; border-radius: 10px; padding: 1px 7px; font-size: 10px; font-weight: 700; }
+
+  .cve-card {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; margin-bottom: 6px;
+    border-left: 3px solid transparent;
+  }
+  .cve-card.critical { border-left-color: var(--critical); }
+  .cve-card.high { border-left-color: #f5a700; }
+  .cve-card.medium { border-left-color: var(--medium); }
+
+  .cve-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px; }
+  .cve-id {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 600;
+    color: var(--accent); text-decoration: none;
+  }
+  .cve-id:hover { text-decoration: underline; }
+  .cvss { font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px; }
+  .cvss.critical { background: rgba(189,39,30,0.1); color: var(--critical); }
+  .cvss.high { background: rgba(245,167,0,0.15); color: #8a6300; }
+  .cvss.medium { background: rgba(1,125,115,0.1); color: var(--medium); }
+  .cve-desc { font-size: 11px; color: var(--text); line-height: 1.4; }
+
+  .controls {
+    position: absolute; bottom: 16px; left: 16px;
+    display: flex; flex-direction: column; gap: 4px; z-index: 10;
+  }
+  .ctrl-btn {
+    background: white; border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); width: 32px; height: 32px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; font-size: 14px; font-weight: 600;
+    box-shadow: var(--shadow); transition: all 0.15s;
+  }
+  .ctrl-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  .tooltip {
+    position: fixed; background: white; border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px; pointer-events: none;
+    z-index: 1000; min-width: 180px; box-shadow: var(--shadow-lg); display: none;
+  }
+  .tt-host { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 600; color: var(--text-bright); margin-bottom: 5px; }
+  .tt-row { display: flex; justify-content: space-between; font-size: 11px; color: var(--text); margin-bottom: 2px; }
+  .tt-vuln { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); font-size: 11px; font-weight: 600; color: var(--exfil); }
+
+  #loading, #error-screen {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 14px; background: var(--bg); z-index: 100;
+  }
+  #error-screen { display: none; }
+  .loading-label { font-size: 12px; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-muted); }
+  .loading-bar { width: 180px; height: 2px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .loading-fill { height: 100%; background: var(--accent); border-radius: 2px; animation: loadbar 1.4s ease-in-out infinite; }
+  @keyframes loadbar { 0%{width:0;margin-left:0} 50%{width:60%} 100%{width:0;margin-left:100%} }
+  .error-title { font-size: 13px; font-weight: 600; color: var(--critical); }
+  .error-msg { font-size: 12px; color: var(--text-muted); text-align: center; max-width: 320px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-mark">
+      <svg viewBox="0 0 16 16"><path d="M8 1L14 4.5v7L8 15 2 11.5v-7L8 1zm0 2L4 5.5v5L8 13l4-2.5v-5L8 3z"/></svg>
+    </div>
+    <h1>Northfield <span>Attack</span> Graph</h1>
+  </div>
+  <div class="header-right">
+    <div class="status-pill">
+      <div class="status-dot" id="status-dot"></div>
+      <span id="status-text">Connecting</span>
+    </div>
+    <div class="header-time" id="header-time">—</div>
+  </div>
+</header>
+
+<div class="filter-bar">
+  <span class="filter-label">Filter</span>
+  <button class="filter-btn active all" data-filter="all">All paths</button>
+  <button class="filter-btn lateral" data-filter="lateral_movement">
+    <span class="filter-dot" style="background:var(--lateral)"></span>Lateral Movement
+  </button>
+  <button class="filter-btn credential" data-filter="credential_access">
+    <span class="filter-dot" style="background:#f5a700"></span>Credential Access
+  </button>
+  <button class="filter-btn data" data-filter="data_access">
+    <span class="filter-dot" style="background:var(--data)"></span>Data Access
+  </button>
+  <button class="filter-btn exfil" data-filter="exfiltration">
+    <span class="filter-dot" style="background:var(--exfil)"></span>Exfiltration
+  </button>
+  <div class="sep"></div>
+  <button class="choke-toggle" id="choke-toggle">◈ Choke Points</button>
+</div>
+
+<div class="main">
+  <div id="graph">
+    <div id="loading">
+      <div class="loading-label">Loading threat intelligence</div>
+      <div class="loading-bar"><div class="loading-fill"></div></div>
+    </div>
+    <div id="error-screen">
+      <div class="error-title">Connection Failed</div>
+      <div class="error-msg" id="error-msg"></div>
+    </div>
+    <svg id="svg">
+      <defs>
+        <filter id="f-glow" x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation="3" result="b"/>
+          <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+        </filter>
+      </defs>
+    </svg>
+    <div class="controls">
+      <button class="ctrl-btn" id="zoom-in">+</button>
+      <button class="ctrl-btn" id="zoom-out">−</button>
+      <button class="ctrl-btn" id="zoom-fit">⊡</button>
+    </div>
+  </div>
+
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-title">Threat Summary</div>
+      <div class="stats-grid">
+        <div class="stat-card c1"><div class="stat-value" id="count-critical">—</div><div class="stat-label">Critical Nodes</div></div>
+        <div class="stat-card c2"><div class="stat-value" id="count-compromised">—</div><div class="stat-label">Compromised</div></div>
+        <div class="stat-card c3"><div class="stat-value" id="count-vulns">—</div><div class="stat-label">Total CVEs</div></div>
+        <div class="stat-card c4"><div class="stat-value" id="count-choke">—</div><div class="stat-label">Choke Points</div></div>
+      </div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-title">Node Types</div>
+      <div class="legend-grid">
+        <div class="legend-row">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="1" y="3" width="14" height="10" rx="1.5" stroke="#49526a" stroke-width="1.5"/><line x1="8" y1="13" x2="8" y2="15" stroke="#49526a" stroke-width="1.5"/><line x1="5" y1="15" x2="11" y2="15" stroke="#49526a" stroke-width="1.5"/></svg>
+          Workstation
+        </div>
+        <div class="legend-row">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="2" y="1" width="12" height="14" rx="1.5" stroke="#49526a" stroke-width="1.5"/><line x1="5" y1="5" x2="11" y2="5" stroke="#49526a" stroke-width="1"/><line x1="5" y1="8" x2="11" y2="8" stroke="#49526a" stroke-width="1"/><line x1="5" y1="11" x2="9" y2="11" stroke="#49526a" stroke-width="1"/></svg>
+          Server
+        </div>
+        <div class="legend-row">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><polygon points="8,1 15,5 15,11 8,15 1,11 1,5" stroke="#49526a" stroke-width="1.5"/></svg>
+          Domain Controller
+        </div>
+        <div class="legend-row">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="#49526a" stroke-width="1.5"/><line x1="8" y1="1.5" x2="8" y2="14.5" stroke="#49526a" stroke-width="1"/><line x1="1.5" y1="8" x2="14.5" y2="8" stroke="#49526a" stroke-width="1"/></svg>
+          Network Share
+        </div>
+        <div class="legend-row">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5" stroke="#6b3fa0" stroke-width="1.5" stroke-dasharray="3,2"/></svg>
+          <span style="color:var(--choke)">Choke Point</span>
+        </div>
+        <div class="legend-row">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="4" stroke="#bd271e" stroke-width="1.5"/><text x="7" y="10" text-anchor="middle" font-size="6" fill="#bd271e" font-weight="bold">!</text></svg>
+          <span style="color:var(--critical)">Compromised</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-title">Attack Path Types</div>
+      <div class="legend-grid">
+        <div class="legend-row"><div class="legend-line" style="background:var(--lateral)"></div>Lateral Movement</div>
+        <div class="legend-row"><div class="legend-line" style="background:#f5a700"></div>Credential Access</div>
+        <div class="legend-row"><div class="legend-line" style="background:var(--data)"></div>Data Access</div>
+        <div class="legend-row"><div class="legend-line" style="background:var(--exfil)"></div>Exfiltration</div>
+        <div class="legend-row">
+          <div style="width:20px;height:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0">
+            <div style="width:10px;height:10px;background:var(--exfil);border-radius:50%;border:1.5px solid white;font-size:7px;color:white;display:flex;align-items:center;justify-content:center;font-weight:700">2</div>
+          </div>
+          CVE badge count
+        </div>
+      </div>
+    </div>
+
+    <div class="detail-panel">
+      <div class="sidebar-title">Node Detail</div>
+      <div class="detail-empty" id="detail-empty">
+        <svg width="28" height="28" viewBox="0 0 28 28" fill="none"><circle cx="14" cy="14" r="12" stroke="#98a2b3" stroke-width="1.5"/><line x1="14" y1="9" x2="14" y2="15" stroke="#98a2b3" stroke-width="1.5" stroke-linecap="round"/><circle cx="14" cy="19" r="1" fill="#98a2b3"/></svg>
+        Click any node to inspect
+      </div>
+      <div id="detail-content" style="display:none">
+        <div class="detail-hostname" id="d-hostname"></div>
+        <span class="detail-type-label" id="d-type"></span>
+        <div class="detail-fields">
+          <div class="detail-field"><span class="detail-field-label">Criticality</span><span id="d-crit" class="badge"></span></div>
+          <div class="detail-field"><span class="detail-field-label">Department</span><span class="detail-field-value" id="d-dept"></span></div>
+          <div class="detail-field"><span class="detail-field-label">Owner</span><span class="detail-field-value" id="d-owner"></span></div>
+          <div class="detail-field"><span class="detail-field-label">IP Address</span><span class="detail-field-value" id="d-ip"></span></div>
+          <div class="detail-field"><span class="detail-field-label">Compromised</span><span id="d-comp" class="badge"></span></div>
+          <div class="detail-field" id="d-choke-row" style="display:none"><span class="detail-field-label">Choke Point</span><span class="badge choke">⚠ Yes</span></div>
+        </div>
+        <div id="d-vuln-section" style="display:none">
+          <div class="vuln-header">Vulnerabilities <span class="vuln-count" id="d-vuln-count"></span></div>
+          <div id="d-vuln-list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="tooltip" id="tooltip">
+  <div class="tt-host" id="tt-host"></div>
+  <div class="tt-row"><span>Type</span><span id="tt-type"></span></div>
+  <div class="tt-row"><span>Criticality</span><span id="tt-crit"></span></div>
+  <div class="tt-vuln" id="tt-vuln"></div>
+</div>
+
+<script>
+const ES_URL  = 'https://northfield-manufacturing-2bcb39.es.europe-west1.gcp.cloud.es.io';
+const API_KEY = 'a0xYM2pwd0Jmc2VZekQ4TWl6QjE6TjMtMEFYWXBQR2trRXNMdy1reGkzZw==';
+
+const NCOL = { critical:'#bd271e', high:'#b36a00', medium:'#017d73', low:'#006bb4' };
+const ECOL = { lateral_movement:'#bd271e', credential_access:'#f5a700', data_access:'#017d73', exfiltration:'#6b3fa0' };
+const NSIZ = { critical:24, high:19, medium:15, low:12 };
+const CHOKE_COL = '#6b3fa0';
+
+let allNodes=[], allEdges=[], chokeIds=new Set();
+let activeFilter='all', showChoke=false;
+let svgEl, gEl, zoom, linkSel, nodeSel, simNodes, simEdges;
+
+async function esQuery(query) {
+  const r = await fetch(`${ES_URL}/northfield-attack-graph/_search`, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json', 'Authorization':`ApiKey ${API_KEY}` },
+    body: JSON.stringify({ size:200, query })
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()).hits.hits.map(h => h._source);
+}
+
+async function init() {
+  try {
+    [allNodes, allEdges] = await Promise.all([
+      esQuery({ term:{ type:'node' } }),
+      esQuery({ term:{ type:'edge' } })
+    ]);
+
+    // Choke point detection
+    const deg = {};
+    allEdges.forEach(e => {
+      deg[e.source_id] = (deg[e.source_id]||0)+1;
+      deg[e.target_id] = (deg[e.target_id]||0)+1;
+    });
+    chokeIds = new Set(Object.entries(deg).filter(([,c])=>c>=3).map(([id])=>id));
+
+    const totalCVEs = allNodes.reduce((s,n)=>s+(n.vulnerabilities?.length||0),0);
+    document.getElementById('count-critical').textContent   = allNodes.filter(n=>n.criticality==='critical').length;
+    document.getElementById('count-compromised').textContent = allNodes.filter(n=>n.compromised).length;
+    document.getElementById('count-vulns').textContent       = totalCVEs;
+    document.getElementById('count-choke').textContent       = chokeIds.size;
+
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('status-text').textContent = 'Live';
+    document.getElementById('header-time').textContent = new Date().toLocaleTimeString();
+
+    buildGraph();
+    setupUI();
+  } catch(e) {
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('error-screen').style.display = 'flex';
+    document.getElementById('error-msg').textContent = e.message;
+    document.getElementById('status-dot').className = 'status-dot error';
+    document.getElementById('status-text').textContent = 'Error';
+  }
+}
+
+function nodeIcon(t) {
+  switch(t) {
+    case 'workstation':
+      return `<rect x="-7" y="-4.5" width="14" height="8.5" rx="1.5" fill="currentColor"/>
+              <line x1="0" y1="4" x2="0" y2="6.5" stroke="currentColor" stroke-width="1.5"/>
+              <line x1="-3" y1="6.5" x2="3" y2="6.5" stroke="currentColor" stroke-width="1.5"/>
+              <rect x="-5.5" y="-3" width="11" height="5.5" rx="0.5" fill="white" opacity="0.25"/>`;
+    case 'server':
+      return `<rect x="-6" y="-7" width="12" height="14" rx="1.5" fill="currentColor"/>
+              <line x1="-4" y1="-3" x2="4" y2="-3" stroke="white" stroke-width="1" opacity="0.5"/>
+              <line x1="-4" y1="0" x2="4" y2="0" stroke="white" stroke-width="1" opacity="0.5"/>
+              <line x1="-4" y1="3" x2="2" y2="3" stroke="white" stroke-width="1" opacity="0.5"/>
+              <circle cx="4" cy="-3" r="1" fill="white" opacity="0.7"/>
+              <circle cx="4" cy="0" r="1" fill="white" opacity="0.7"/>`;
+    case 'domain_controller':
+      return `<polygon points="0,-8 7.5,-4 7.5,4 0,8 -7.5,4 -7.5,-4" fill="currentColor"/>
+              <text y="3" text-anchor="middle" font-size="5.5" font-weight="800" fill="white" font-family="Inter,sans-serif">DC</text>`;
+    default:
+      return `<circle r="7" fill="currentColor"/>
+              <line x1="-4" y1="0" x2="4" y2="0" stroke="white" stroke-width="1.5"/>
+              <line x1="0" y1="-4" x2="0" y2="4" stroke="white" stroke-width="1.5"/>
+              <ellipse cx="0" cy="0" rx="7" ry="3.5" fill="none" stroke="white" stroke-width="1" opacity="0.4"/>`;
+  }
+}
+
+function buildGraph() {
+  const cont = document.getElementById('graph');
+  const W = cont.clientWidth, H = cont.clientHeight;
+
+  svgEl = d3.select('#svg');
+  svgEl.selectAll('g.main-g').remove();
+  gEl = svgEl.append('g').attr('class','main-g');
+
+  zoom = d3.zoom().scaleExtent([0.15,4]).on('zoom', e => gEl.attr('transform', e.transform));
+  svgEl.call(zoom);
+
+  // Arrow markers
+  const defs = svgEl.select('defs');
+  defs.selectAll('marker').remove();
+  Object.entries(ECOL).forEach(([type, col]) => {
+    defs.append('marker')
+      .attr('id',`arr-${type}`)
+      .attr('viewBox','0 -4 8 8').attr('refX',28).attr('refY',0)
+      .attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
+      .append('path').attr('d','M0,-4L8,0L0,4').attr('fill',col).attr('opacity',0.85);
+  });
+
+  const nodeMap = {};
+  allNodes.forEach(n => nodeMap[n.node_id] = n);
+
+  simNodes = allNodes.map(n => ({...n, id:n.node_id}));
+  const edgesFiltered = activeFilter==='all' ? allEdges : allEdges.filter(e=>e.edge_type===activeFilter);
+  simEdges = edgesFiltered
+    .filter(e => nodeMap[e.source_id] && nodeMap[e.target_id])
+    .map(e => ({...e, source:e.source_id, target:e.target_id}));
+
+  const sim = d3.forceSimulation(simNodes)
+    .force('link', d3.forceLink(simEdges).id(d=>d.id).distance(180))
+    .force('charge', d3.forceManyBody().strength(-550))
+    .force('center', d3.forceCenter(W/2, H/2))
+    .force('collide', d3.forceCollide(d => NSIZ[d.criticality]+30));
+
+  // Edges
+  linkSel = gEl.append('g').selectAll('line')
+    .data(simEdges).enter().append('line')
+    .attr('class','edge-flow')
+    .attr('stroke', d => ECOL[d.edge_type]||'#999')
+    .attr('stroke-width', 1.8)
+    .attr('stroke-opacity', 0.5)
+    .attr('marker-end', d => `url(#arr-${d.edge_type})`);
+
+  // Nodes
+  const ng = gEl.append('g');
+  nodeSel = ng.selectAll('g.node')
+    .data(simNodes).enter().append('g').attr('class','node')
+    .style('cursor','pointer')
+    .call(d3.drag()
+      .on('start',(e,d)=>{ if(!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
+      .on('drag', (e,d)=>{ d.fx=e.x; d.fy=e.y; })
+      .on('end',  (e,d)=>{ if(!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; })
+    );
+
+  // Choke halo
+  nodeSel.filter(d => showChoke && chokeIds.has(d.node_id))
+    .append('circle').attr('class','choke-ring')
+    .attr('r', d => NSIZ[d.criticality]+12)
+    .attr('fill','none').attr('stroke',CHOKE_COL)
+    .attr('stroke-width',1.5).attr('stroke-dasharray','4,3').attr('opacity',0.65);
+
+  // Compromised ring
+  nodeSel.filter(d => d.compromised)
+    .append('circle').attr('class','comp-ring')
+    .attr('r', d => NSIZ[d.criticality]+7)
+    .attr('fill','none').attr('stroke',NCOL.critical)
+    .attr('stroke-width',1.5).attr('stroke-dasharray','3,2').attr('opacity',0.55);
+
+  // Glow bg
+  nodeSel.append('circle').attr('class','glow-bg')
+    .attr('r', d => NSIZ[d.criticality]+3)
+    .attr('fill', d => NCOL[d.criticality]||'#999')
+    .attr('opacity', 0.13);
+
+  // Icon — scale icon to fit within node radius
+  nodeSel.append('g').attr('class','icon-g')
+    .attr('color', d => NCOL[d.criticality]||'#999')
+    .each(function(d) {
+      const s = (NSIZ[d.criticality] || 15) / 14;
+      d3.select(this).append('g')
+        .attr('transform', `scale(${s})`)
+        .html(nodeIcon(d.node_type));
+    });
+
+  // CVE badge
+  const badgeG = nodeSel.filter(d => d.vulnerabilities?.length > 0)
+    .append('g').attr('class','vuln-badge')
+    .attr('transform', d => `translate(${NSIZ[d.criticality]-1},${-NSIZ[d.criticality]+1})`);
+
+  badgeG.append('circle').attr('r',8).attr('fill',CHOKE_COL).attr('stroke','white').attr('stroke-width',1.5);
+  badgeG.append('text')
+    .attr('text-anchor','middle').attr('dy',4)
+    .attr('font-size',8).attr('font-weight',700)
+    .attr('font-family','Inter,sans-serif').attr('fill','white')
+    .text(d => d.vulnerabilities.length);
+
+  // Label
+  nodeSel.append('text').attr('class','node-label')
+    .attr('dy', d => NSIZ[d.criticality]+15)
+    .attr('text-anchor','middle')
+    .attr('fill','#49526a')
+    .attr('font-family','JetBrains Mono, monospace')
+    .attr('font-size', 9.5).attr('font-weight',500)
+    .text(d => d.label);
+
+  // Tooltip & click
+  const tip = document.getElementById('tooltip');
+  nodeSel
+    .on('mouseover',(e,d) => {
+      tip.style.display = 'block';
+      document.getElementById('tt-host').textContent = d.label;
+      document.getElementById('tt-type').textContent = d.node_type.replace(/_/g,' ');
+      document.getElementById('tt-crit').textContent = d.criticality;
+      const tv = document.getElementById('tt-vuln');
+      if (d.vulnerabilities?.length) {
+        tv.style.display = 'block';
+        const ids = d.vulnerabilities.map(v => v.cve).join(', ');
+        tv.textContent = `CVEs: ${ids}`;
+      } else {
+        tv.style.display = 'none';
+      }
+    })
+    .on('mousemove', e => { tip.style.left=(e.clientX+14)+'px'; tip.style.top=(e.clientY-28)+'px'; })
+    .on('mouseout',  () => { tip.style.display='none'; })
+    .on('click', (e, d) => { e.stopPropagation(); showDetail(d); applyBlast(d); });
+
+  svgEl.on('click', () => { resetHighlight(); clearDetail(); });
+
+  sim.on('tick', () => {
+    linkSel.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
+           .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
+    nodeSel.attr('transform',d=>`translate(${d.x},${d.y})`);
+  });
+
+  sim.on('end', fitView);
+  setTimeout(fitView, 1200);
+}
+
+function applyBlast(d) {
+  const conn = new Set([d.node_id]);
+  simEdges.forEach(e => {
+    const s = typeof e.source==='object'?e.source.id:e.source;
+    const t = typeof e.target==='object'?e.target.id:e.target;
+    if (s===d.node_id) conn.add(t);
+    if (t===d.node_id) conn.add(s);
+  });
+
+  nodeSel.select('g.icon-g').attr('opacity', n => conn.has(n.node_id)?1:0.15);
+  nodeSel.select('circle.glow-bg').attr('opacity', n => conn.has(n.node_id)?0.18:0.04);
+  nodeSel.select('text.node-label').attr('opacity', n => conn.has(n.node_id)?1:0.15);
+  nodeSel.select('g.vuln-badge').attr('opacity', n => conn.has(n.node_id)?1:0.15);
+
+  linkSel.attr('stroke-opacity', e => {
+    const s = typeof e.source==='object'?e.source.id:e.source;
+    const t = typeof e.target==='object'?e.target.id:e.target;
+    return (s===d.node_id||t===d.node_id)?0.95:0.05;
+  }).attr('stroke-width', e => {
+    const s = typeof e.source==='object'?e.source.id:e.source;
+    const t = typeof e.target==='object'?e.target.id:e.target;
+    return (s===d.node_id||t===d.node_id)?2.8:1.8;
+  });
+}
+
+function resetHighlight() {
+  if (!nodeSel) return;
+  nodeSel.select('g.icon-g').attr('opacity',1);
+  nodeSel.select('circle.glow-bg').attr('opacity',0.13);
+  nodeSel.select('text.node-label').attr('opacity',1);
+  nodeSel.select('g.vuln-badge').attr('opacity',1);
+  if (linkSel) linkSel.attr('stroke-opacity',0.5).attr('stroke-width',1.8);
+}
+
+function showDetail(d) {
+  document.getElementById('detail-empty').style.display = 'none';
+  document.getElementById('detail-content').style.display = 'block';
+  document.getElementById('d-hostname').textContent = d.label;
+  document.getElementById('d-type').textContent = d.node_type.replace(/_/g,' ').toUpperCase();
+  document.getElementById('d-dept').textContent = d.department||'—';
+  document.getElementById('d-owner').textContent = d.owner||'—';
+  document.getElementById('d-ip').textContent = d.ip||'—';
+
+  const crit = document.getElementById('d-crit');
+  crit.textContent = d.criticality; crit.className = `badge ${d.criticality}`;
+
+  const comp = document.getElementById('d-comp');
+  comp.textContent = d.compromised?'YES':'NO'; comp.className = `badge ${d.compromised?'yes':'no'}`;
+
+  document.getElementById('d-choke-row').style.display = chokeIds.has(d.node_id)?'flex':'none';
+
+  const vs = document.getElementById('d-vuln-section');
+  if (d.vulnerabilities?.length) {
+    vs.style.display = 'block';
+    document.getElementById('d-vuln-count').textContent = d.vulnerabilities.length;
+    const list = document.getElementById('d-vuln-list');
+    list.innerHTML = '';
+    d.vulnerabilities.forEach(v => {
+      const nvdUrl = `https://nvd.nist.gov/vuln/detail/${v.cve}`;
+      list.innerHTML += `
+        <div class="cve-card ${v.severity}">
+          <div class="cve-header">
+            <a class="cve-id" href="${nvdUrl}" target="_blank" rel="noopener" title="View on NVD">${v.cve} ↗</a>
+            <span class="cvss ${v.severity}">CVSS ${v.cvss}</span>
+          </div>
+          <div class="cve-desc">${v.description}</div>
+        </div>`;
+    });
+  } else { vs.style.display='none'; }
+}
+
+function clearDetail() {
+  document.getElementById('detail-empty').style.display = 'flex';
+  document.getElementById('detail-content').style.display = 'none';
+}
+
+function fitView() {
+  if (!nodeSel || nodeSel.empty()) return;
+  const c = document.getElementById('graph');
+  const W = c.clientWidth, H = c.clientHeight;
+  // Get actual bounds from simulation node positions
+  if (!simNodes || simNodes.length === 0) return;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  simNodes.forEach(d => {
+    const r = (NSIZ[d.criticality] || 15) + 20;
+    if (d.x - r < x0) x0 = d.x - r;
+    if (d.y - r < y0) y0 = d.y - r;
+    if (d.x + r > x1) x1 = d.x + r;
+    if (d.y + r > y1) y1 = d.y + r;
+  });
+  const bw = x1 - x0, bh = y1 - y0;
+  const scale = Math.min(0.92, Math.min(W / bw, H / bh));
+  const tx = W / 2 - scale * (x0 + bw / 2);
+  const ty = H / 2 - scale * (y0 + bh / 2);
+  svgEl.transition().duration(600)
+    .call(zoom.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+}
+
+function setupUI() {
+  document.getElementById('zoom-in').onclick  = () => svgEl.transition().duration(250).call(zoom.scaleBy,1.3);
+  document.getElementById('zoom-out').onclick = () => svgEl.transition().duration(250).call(zoom.scaleBy,0.77);
+  document.getElementById('zoom-fit').onclick = fitView;
+
+  document.querySelectorAll('.filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      activeFilter = btn.dataset.filter;
+      resetHighlight(); clearDetail();
+      gEl.selectAll('*').remove();
+      buildGraph();
+    });
+  });
+
+  document.getElementById('choke-toggle').addEventListener('click', function() {
+    showChoke = !showChoke;
+    this.classList.toggle('active', showChoke);
+    this.textContent = showChoke ? '◈ Hide Choke Points' : '◈ Choke Points';
+    resetHighlight(); clearDetail();
+    gEl.selectAll('*').remove();
+    buildGraph();
+  });
+}
+
+init();
+</script>
+</body>
+</html>

@@ -1,0 +1,1374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Northfield Manufacturing — Attack Path Analysis</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #0d1117;
+    --surface:   #161b22;
+    --surface2:  #1c2128;
+    --border:    rgba(255,255,255,0.08);
+    --border2:   rgba(255,255,255,0.04);
+    --text:      #c9d1d9;
+    --text-dim:  #6e7681;
+    --text-bright: #f0f6fc;
+    --critical:  #ff4444;
+    --high:      #f5a623;
+    --medium:    #3fb950;
+    --low:       #58a6ff;
+    --choke:     #bc8cff;
+    --lateral:   #ff4444;
+    --credential:#f5a623;
+    --data:      #3fb950;
+    --exfil:     #bc8cff;
+    --accent:    #58a6ff;
+    --phase1:    #ff6b6b;
+    --phase2:    #ffd93d;
+    --phase3:    #6bcb77;
+    --phase4:    #4d96ff;
+    --phase5:    #bc8cff;
+  }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  body {
+    background: var(--bg);
+    font-family: 'IBM Plex Sans', sans-serif;
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── HEADER ── */
+  header {
+    height: 52px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 16px;
+    flex-shrink: 0;
+    z-index: 20;
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+
+  .logo-icon {
+    width: 28px; height: 28px;
+    background: linear-gradient(135deg, #ff4444, #bc8cff);
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .logo-icon svg { width: 14px; height: 14px; fill: white; }
+
+  .logo-text {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-bright);
+    letter-spacing: 0.01em;
+  }
+  .logo-text span { color: var(--critical); }
+
+  .header-divider {
+    width: 1px; height: 24px;
+    background: var(--border);
+    flex-shrink: 0;
+  }
+
+  .scenario-label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.05em;
+  }
+  .scenario-label strong {
+    color: var(--high);
+    font-weight: 600;
+  }
+
+  .header-spacer { flex: 1; }
+
+  .live-badge {
+    display: flex; align-items: center; gap: 6px;
+    background: rgba(63,185,80,0.1);
+    border: 1px solid rgba(63,185,80,0.25);
+    border-radius: 20px;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-family: 'IBM Plex Mono', monospace;
+    color: var(--medium);
+    flex-shrink: 0;
+  }
+  .live-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--medium);
+    animation: pulse 2s infinite;
+  }
+  .live-dot.error { background: var(--critical); animation: none; }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(0.8)} }
+
+  .header-time {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+  }
+
+  /* ── PHASE BAR ── */
+  .phase-bar {
+    height: 36px;
+    background: var(--surface2);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    gap: 4px;
+    flex-shrink: 0;
+    overflow-x: auto;
+  }
+  .phase-bar::-webkit-scrollbar { display: none; }
+
+  .phase-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+    margin-right: 6px;
+    flex-shrink: 0;
+  }
+
+  .phase-btn {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 12px;
+    border-radius: 4px;
+    border: 1px solid transparent;
+    background: transparent;
+    font-size: 11px;
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-weight: 500;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .phase-btn:hover { background: var(--surface); color: var(--text); }
+  .phase-btn.active {
+    background: var(--surface);
+    border-color: var(--border);
+    color: var(--text-bright);
+  }
+  .phase-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+
+  .phase-sep { width: 1px; height: 16px; background: var(--border); margin: 0 4px; flex-shrink: 0; }
+
+  .choke-btn {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 12px;
+    border-radius: 4px;
+    border: 1px solid rgba(188,140,255,0.25);
+    background: rgba(188,140,255,0.06);
+    font-size: 11px;
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-weight: 500;
+    color: var(--choke);
+    cursor: pointer;
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+  .choke-btn:hover { background: rgba(188,140,255,0.12); }
+  .choke-btn.active { background: rgba(188,140,255,0.15); border-color: rgba(188,140,255,0.4); }
+
+  /* ── MAIN LAYOUT ── */
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* ── GRAPH ── */
+  #graph { flex: 1; position: relative; overflow: hidden; }
+  #graph svg { width: 100%; height: 100%; }
+
+  @keyframes flow { to { stroke-dashoffset: -20; } }
+  .edge-animated { stroke-dasharray: 6 4; animation: flow 1.2s linear infinite; }
+
+  .node-g { cursor: pointer; }
+
+  /* ── CONTROLS ── */
+  .graph-controls {
+    position: absolute;
+    bottom: 16px; left: 16px;
+    display: flex; flex-direction: column; gap: 4px;
+    z-index: 10;
+  }
+  .ctrl-btn {
+    width: 30px; height: 30px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-size: 14px; font-weight: 600;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .ctrl-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ── RIGHT PANEL ── */
+  .right-panel {
+    width: 320px;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .panel-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .panel-tab {
+    flex: 1;
+    padding: 10px 0;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    cursor: pointer;
+    text-align: center;
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+    background: none;
+    border-top: none;
+    border-left: none;
+    border-right: none;
+    font-family: 'IBM Plex Sans', sans-serif;
+  }
+  .panel-tab:hover { color: var(--text); }
+  .panel-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .panel-body { flex: 1; overflow-y: auto; }
+  .panel-body::-webkit-scrollbar { width: 4px; }
+  .panel-body::-webkit-scrollbar-track { background: transparent; }
+  .panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  .tab-content { display: none; padding: 14px; }
+  .tab-content.active { display: block; }
+
+  /* ── STATS TAB ── */
+  .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+  .stat-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    position: relative;
+    overflow: hidden;
+  }
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+  }
+  .stat-card.s-critical::before { background: var(--critical); }
+  .stat-card.s-high::before { background: var(--high); }
+  .stat-card.s-choke::before { background: var(--choke); }
+  .stat-card.s-cve::before { background: var(--accent); }
+
+  .stat-val {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 28px;
+    font-weight: 600;
+    line-height: 1;
+    margin-bottom: 4px;
+  }
+  .s-critical .stat-val { color: var(--critical); }
+  .s-high .stat-val { color: var(--high); }
+  .s-choke .stat-val { color: var(--choke); }
+  .s-cve .stat-val { color: var(--accent); }
+  .stat-lbl { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); }
+
+  .section-title {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+  }
+
+  .legend { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+  .legend-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text); }
+  .leg-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .leg-line { width: 20px; height: 2px; flex-shrink: 0; border-radius: 1px; }
+
+  /* ── NARRATIVE TAB ── */
+  .narrative-header {
+    background: linear-gradient(135deg, rgba(255,68,68,0.1), rgba(188,140,255,0.1));
+    border: 1px solid rgba(255,68,68,0.2);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 14px;
+  }
+  .narrative-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-bright);
+    margin-bottom: 4px;
+  }
+  .narrative-sub {
+    font-size: 11px;
+    color: var(--text-dim);
+    line-height: 1.5;
+  }
+
+  .attack-phase {
+    margin-bottom: 12px;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .phase-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    cursor: pointer;
+    background: var(--surface2);
+    transition: background 0.15s;
+  }
+  .phase-header:hover { background: rgba(255,255,255,0.04); }
+  .phase-num {
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: 'IBM Plex Mono', monospace;
+    flex-shrink: 0;
+    color: white;
+  }
+  .phase-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-bright);
+    flex: 1;
+  }
+  .phase-mitre {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    color: var(--text-dim);
+  }
+  .phase-chevron {
+    font-size: 10px;
+    color: var(--text-dim);
+    transition: transform 0.2s;
+  }
+  .attack-phase.open .phase-chevron { transform: rotate(90deg); }
+
+  .phase-body {
+    display: none;
+    padding: 10px;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+  }
+  .attack-phase.open .phase-body { display: block; }
+
+  .phase-finding {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    line-height: 1.5;
+  }
+  .finding-badge {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: rgba(88,166,255,0.1);
+    color: var(--accent);
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  .phase-impact {
+    margin-top: 8px;
+    padding: 6px 8px;
+    background: rgba(255,68,68,0.06);
+    border-left: 2px solid var(--critical);
+    border-radius: 0 4px 4px 0;
+    font-size: 11px;
+    color: var(--text);
+    line-height: 1.5;
+  }
+
+  /* ── NODE DETAIL TAB ── */
+  .detail-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    gap: 10px;
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+  }
+  .detail-empty svg { opacity: 0.3; }
+
+  .node-detail-header {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 12px;
+  }
+  .node-hostname {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-bright);
+    margin-bottom: 3px;
+    word-break: break-all;
+  }
+  .node-type-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+  }
+
+  .detail-fields { margin-bottom: 12px; }
+  .detail-field {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border2);
+    font-size: 12px;
+  }
+  .field-label { color: var(--text-dim); font-size: 11px; }
+  .field-value { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--text); }
+
+  .badge {
+    display: inline-flex; align-items: center;
+    padding: 2px 7px; border-radius: 3px;
+    font-size: 10px; font-weight: 700;
+    letter-spacing: 0.05em; text-transform: uppercase;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+  .badge.critical { background: rgba(255,68,68,0.12); color: var(--critical); }
+  .badge.high { background: rgba(245,166,35,0.12); color: var(--high); }
+  .badge.medium { background: rgba(63,185,80,0.12); color: var(--medium); }
+  .badge.low { background: rgba(88,166,255,0.12); color: var(--accent); }
+  .badge.yes { background: rgba(255,68,68,0.12); color: var(--critical); }
+  .badge.no { background: rgba(63,185,80,0.12); color: var(--medium); }
+  .badge.choke { background: rgba(188,140,255,0.12); color: var(--choke); }
+
+  .conn-section { margin-bottom: 12px; }
+  .conn-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-dim); margin-bottom: 8px; }
+  .conn-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px;
+    border-radius: 4px;
+    background: var(--surface2);
+    margin-bottom: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .conn-item:hover { background: rgba(88,166,255,0.08); }
+  .conn-direction { font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: var(--text-dim); flex-shrink: 0; }
+  .conn-host { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--text); flex: 1; }
+  .conn-type { font-size: 10px; color: var(--text-dim); }
+
+  .vuln-section { }
+  .vuln-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-dim); margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+  .vuln-count-badge { background: var(--choke); color: white; border-radius: 10px; padding: 1px 7px; font-size: 10px; font-weight: 700; }
+
+  .cve-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 8px 10px;
+    margin-bottom: 6px;
+    border-left: 2px solid transparent;
+  }
+  .cve-card.critical { border-left-color: var(--critical); }
+  .cve-card.high { border-left-color: var(--high); }
+  .cve-card.medium { border-left-color: var(--medium); }
+  .cve-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+  .cve-id { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: var(--accent); text-decoration: none; }
+  .cve-id:hover { text-decoration: underline; }
+  .cvss { font-family: 'IBM Plex Mono', monospace; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 3px; }
+  .cvss.critical { background: rgba(255,68,68,0.12); color: var(--critical); }
+  .cvss.high { background: rgba(245,166,35,0.12); color: var(--high); }
+  .cvss.medium { background: rgba(63,185,80,0.12); color: var(--medium); }
+  .cve-desc { font-size: 11px; color: var(--text-dim); line-height: 1.4; }
+
+  /* ── LOADING / ERROR ── */
+  #loading, #error-screen {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 12px; background: var(--bg); z-index: 50;
+  }
+  #error-screen { display: none; }
+  .load-text { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-dim); }
+  .load-bar { width: 160px; height: 2px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .load-fill { height: 100%; background: var(--accent); border-radius: 2px; animation: loadbar 1.6s ease-in-out infinite; }
+  @keyframes loadbar { 0%{width:0;margin-left:0} 50%{width:60%} 100%{width:0;margin-left:100%} }
+  .err-title { font-size: 13px; font-weight: 600; color: var(--critical); }
+  .err-msg { font-size: 11px; color: var(--text-dim); text-align: center; max-width: 280px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">
+      <svg viewBox="0 0 16 16"><path d="M8 1L14 4.5v7L8 15 2 11.5v-7L8 1zm0 2L4 5.5v5L8 13l4-2.5v-5L8 3z"/></svg>
+    </div>
+    <div class="logo-text">Northfield <span>Attack</span> Path Analysis</div>
+  </div>
+  <div class="header-divider"></div>
+  <div class="scenario-label">Scenario: <strong>External Attacker → Full Domain Compromise</strong></div>
+  <div class="header-spacer"></div>
+  <div class="live-badge">
+    <div class="live-dot" id="live-dot"></div>
+    <span id="live-text">Connecting</span>
+  </div>
+  <div class="header-time" id="header-time">—</div>
+</header>
+
+<div class="phase-bar">
+  <span class="phase-label">Filter</span>
+  <button class="phase-btn active" data-filter="all">All Paths</button>
+  <button class="phase-btn" data-filter="lateral_movement">
+    <span class="phase-dot" style="background:var(--lateral)"></span>Lateral Movement
+  </button>
+  <button class="phase-btn" data-filter="credential_access">
+    <span class="phase-dot" style="background:var(--credential)"></span>Credential Access
+  </button>
+  <button class="phase-btn" data-filter="data_access">
+    <span class="phase-dot" style="background:var(--data)"></span>Data Access
+  </button>
+  <button class="phase-btn" data-filter="exfiltration">
+    <span class="phase-dot" style="background:var(--exfil)"></span>Exfiltration
+  </button>
+  <div class="phase-sep"></div>
+  <button class="choke-btn" id="choke-btn">◈ Choke Points</button>
+</div>
+
+<div class="main">
+  <div id="graph">
+    <div id="loading">
+      <div class="load-text">Loading attack graph</div>
+      <div class="load-bar"><div class="load-fill"></div></div>
+    </div>
+    <div id="error-screen">
+      <div class="err-title">Connection Failed</div>
+      <div class="err-msg" id="err-msg"></div>
+    </div>
+    <svg id="svg">
+      <defs>
+        <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation="2.5" result="b"/>
+          <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+        </filter>
+      </defs>
+    </svg>
+    <div class="graph-controls">
+      <button class="ctrl-btn" id="btn-zoomin">+</button>
+      <button class="ctrl-btn" id="btn-zoomout">−</button>
+      <button class="ctrl-btn" id="btn-fit" title="Fit to view">⊡</button>
+    </div>
+  </div>
+
+  <div class="right-panel">
+    <div class="panel-tabs">
+      <button class="panel-tab active" data-tab="node">Node Detail</button>
+      <button class="panel-tab" data-tab="narrative">Attack Story</button>
+      <button class="panel-tab" data-tab="legend">Legend</button>
+    </div>
+    <div class="panel-body">
+
+      <!-- NODE DETAIL TAB -->
+      <div class="tab-content active" id="tab-node">
+        <div class="detail-empty" id="detail-empty">
+          <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+            <circle cx="16" cy="16" r="14" stroke="#6e7681" stroke-width="1.5"/>
+            <line x1="16" y1="10" x2="16" y2="17" stroke="#6e7681" stroke-width="1.5" stroke-linecap="round"/>
+            <circle cx="16" cy="21" r="1.5" fill="#6e7681"/>
+          </svg>
+          Click any node to inspect
+        </div>
+        <div id="detail-content" style="display:none">
+          <div class="node-detail-header">
+            <div class="node-hostname" id="d-name"></div>
+            <div class="node-type-label" id="d-type"></div>
+          </div>
+          <div class="detail-fields">
+            <div class="detail-field"><span class="field-label">Criticality</span><span id="d-crit" class="badge"></span></div>
+            <div class="detail-field"><span class="field-label">Department</span><span class="field-value" id="d-dept"></span></div>
+            <div class="detail-field"><span class="field-label">Owner</span><span class="field-value" id="d-owner"></span></div>
+            <div class="detail-field"><span class="field-label">IP Address</span><span class="field-value" id="d-ip"></span></div>
+            <div class="detail-field"><span class="field-label">Compromised</span><span id="d-comp" class="badge"></span></div>
+            <div class="detail-field" id="d-choke-row" style="display:none"><span class="field-label">Choke Point</span><span class="badge choke">⚠ Yes</span></div>
+          </div>
+          <div class="conn-section" id="d-conn-section" style="display:none">
+            <div class="conn-title">Connections</div>
+            <div id="d-conn-list"></div>
+          </div>
+          <div class="vuln-section" id="d-vuln-section" style="display:none">
+            <div class="vuln-title">Vulnerabilities <span class="vuln-count-badge" id="d-vuln-count"></span></div>
+            <div id="d-vuln-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ATTACK NARRATIVE TAB -->
+      <div class="tab-content" id="tab-narrative">
+        <div class="narrative-header">
+          <div class="narrative-title" id="narrative-title">Loading analysis...</div>
+          <div class="narrative-sub" id="narrative-sub"></div>
+        </div>
+
+        <div class="attack-phase open" data-phase="1">
+          <div class="phase-header">
+            <div class="phase-num" style="background:var(--phase1)">1</div>
+            <div class="phase-name">Initial Access</div>
+            <div class="phase-mitre">T1566</div>
+            <div class="phase-chevron">▶</div>
+          </div>
+          <div class="phase-body">
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-001</span>
+              Finance user fatima.khan3 in Domain Admins — primary phishing target
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-004</span>
+              Executive accounts christopher.ahmed, william.macdonald3 in Domain Admins
+            </div>
+            <div class="phase-impact">Single phishing email to a Finance or Executive user yields immediate Domain Admin credentials. No privilege escalation required.</div>
+          </div>
+        </div>
+
+        <div class="attack-phase" data-phase="2">
+          <div class="phase-header">
+            <div class="phase-num" style="background:var(--phase2)">2</div>
+            <div class="phase-name">Discovery</div>
+            <div class="phase-mitre">T1087 · T1482</div>
+            <div class="phase-chevron">▶</div>
+          </div>
+          <div class="phase-body">
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-006</span>
+              Ghost admin james.hartley.admin discovered — never logged in, Domain Admin
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-008</span>
+              Contractor ext.john.briggs still active with VPN + Dev access
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-014</span>
+              Operations user with Finance, HR, IT and Executive group access mapped
+            </div>
+            <div class="phase-impact">Attacker enumerates AD, identifies high-value targets and multiple persistence paths without triggering alerts.</div>
+          </div>
+        </div>
+
+        <div class="attack-phase" data-phase="3">
+          <div class="phase-header">
+            <div class="phase-num" style="background:var(--phase3)">3</div>
+            <div class="phase-name">Credential Access</div>
+            <div class="phase-mitre">T1558.003 · T1558.004</div>
+            <div class="phase-chevron">▶</div>
+          </div>
+          <div class="phase-body">
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-013</span>
+              aisha.li2 Kerberoastable — SPN set on developer account, RC4 ticket cracked offline
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-012</span>
+              IT account ASREPRoastable — pre-auth disabled, hash captured without logon
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-011</span>
+              legacy.app.svc — password not required, authenticates with empty credential
+            </div>
+            <div class="phase-impact">Multiple credential harvesting paths available. Offline cracking yields additional valid accounts with no lockout risk.</div>
+          </div>
+        </div>
+
+        <div class="attack-phase" data-phase="4">
+          <div class="phase-header">
+            <div class="phase-num" style="background:var(--phase4)">4</div>
+            <div class="phase-name">Lateral Movement</div>
+            <div class="phase-mitre">T1078 · T1558</div>
+            <div class="phase-chevron">▶</div>
+          </div>
+          <div class="phase-body">
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-018</span>
+              Unconstrained delegation on Dev account — TGTs harvested for any authenticating user
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-016</span>
+              IT Manager using daily account for admin tasks — no separation, immediate DA on compromise
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-005</span>
+              Developer in Schema Admins — forest-level control path available
+            </div>
+            <div class="phase-impact">Attacker moves laterally using harvested Kerberos tickets. Unconstrained delegation enables impersonation of Domain Admins.</div>
+          </div>
+        </div>
+
+        <div class="attack-phase" data-phase="5">
+          <div class="phase-header">
+            <div class="phase-num" style="background:var(--phase5)">5</div>
+            <div class="phase-name">Persistence</div>
+            <div class="phase-mitre">T1098 · T1078</div>
+            <div class="phase-chevron">▶</div>
+          </div>
+          <div class="phase-body">
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-002</span>
+              svc-backup in Domain Admins — service account provides persistent elevated access
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-020</span>
+              temp.vendor.access with VPN, weak password, never expires — persistent external foothold
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-019</span>
+              Marketing user in Account Operators — indirect privilege escalation path maintained
+            </div>
+            <div class="phase-impact">Multiple persistence mechanisms established. Full remediation requires identifying all compromised accounts — estimated 6-18 months.</div>
+          </div>
+        </div>
+
+        <div class="attack-phase" data-phase="6">
+          <div class="phase-header">
+            <div class="phase-num" style="background:var(--critical)">6</div>
+            <div class="phase-name">Exfiltration</div>
+            <div class="phase-mitre">T1048 · T1003</div>
+            <div class="phase-chevron">▶</div>
+          </div>
+          <div class="phase-body">
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-007</span>
+              shared.finance account — data exfiltrated with no individual audit trail
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-017</span>
+              Reversible encryption on Finance account — plaintext passwords recoverable from NTDS
+            </div>
+            <div class="phase-finding">
+              <span class="finding-badge">MISC-015</span>
+              Unrestricted VPN group — exfiltration channel via legitimate VPN connection
+            </div>
+            <div class="phase-impact">Financial data exfiltrated via VPN. Audit trail obscured by shared account. GDPR/FCA breach notification required within 72 hours.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- LEGEND TAB -->
+      <div class="tab-content" id="tab-legend">
+        <div class="section-title">Node Types</div>
+        <div class="legend" style="margin-bottom:20px">
+          <div class="legend-row">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="1" y="3" width="14" height="10" rx="1.5" stroke="#6e7681" stroke-width="1.5"/><line x1="8" y1="13" x2="8" y2="15" stroke="#6e7681" stroke-width="1.5"/><line x1="5" y1="15" x2="11" y2="15" stroke="#6e7681" stroke-width="1.5"/></svg>
+            Workstation
+          </div>
+          <div class="legend-row">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="2" y="1" width="12" height="14" rx="1.5" stroke="#6e7681" stroke-width="1.5"/><line x1="5" y1="5" x2="11" y2="5" stroke="#6e7681" stroke-width="1"/><line x1="5" y1="8" x2="11" y2="8" stroke="#6e7681" stroke-width="1"/></svg>
+            Server
+          </div>
+          <div class="legend-row">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><polygon points="8,1 15,5 15,11 8,15 1,11 1,5" stroke="#6e7681" stroke-width="1.5"/></svg>
+            Domain Controller
+          </div>
+          <div class="legend-row">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="#6e7681" stroke-width="1.5"/><line x1="8" y1="1.5" x2="8" y2="14.5" stroke="#6e7681" stroke-width="1"/><line x1="1.5" y1="8" x2="14.5" y2="8" stroke="#6e7681" stroke-width="1"/></svg>
+            Network Share
+          </div>
+        </div>
+
+        <div class="section-title">Node Criticality</div>
+        <div class="legend" style="margin-bottom:20px">
+          <div class="legend-row"><div class="leg-dot" style="background:var(--critical)"></div><span class="badge critical">Critical</span> — Domain Admins, DCs, Schema Admins</div>
+          <div class="legend-row"><div class="leg-dot" style="background:var(--high)"></div><span class="badge high">High</span> — Servers, privileged accounts</div>
+          <div class="legend-row"><div class="leg-dot" style="background:var(--medium)"></div><span class="badge medium">Medium</span> — Standard workstations</div>
+          <div class="legend-row"><div class="leg-dot" style="background:var(--low)"></div><span class="badge low">Low</span> — Network shares, peripheral</div>
+        </div>
+
+        <div class="section-title">Attack Path Types</div>
+        <div class="legend" style="margin-bottom:20px">
+          <div class="legend-row"><div class="leg-line" style="background:var(--lateral)"></div>Lateral Movement</div>
+          <div class="legend-row"><div class="leg-line" style="background:var(--credential)"></div>Credential Access</div>
+          <div class="legend-row"><div class="leg-line" style="background:var(--data)"></div>Data Access</div>
+          <div class="legend-row"><div class="leg-line" style="background:var(--exfil)"></div>Exfiltration</div>
+        </div>
+
+        <div class="section-title">Indicators</div>
+        <div class="legend">
+          <div class="legend-row">
+            <svg width="14" height="14"><circle cx="7" cy="7" r="5" fill="none" stroke="var(--choke)" stroke-width="1.5" stroke-dasharray="3,2"/></svg>
+            <span style="color:var(--choke)">Choke Point</span> — high-connectivity node
+          </div>
+          <div class="legend-row">
+            <svg width="14" height="14"><circle cx="7" cy="7" r="4" fill="none" stroke="var(--critical)" stroke-width="1.5" stroke-dasharray="3,2"/></svg>
+            <span style="color:var(--critical)">Compromised</span> — active breach indicator
+          </div>
+          <div class="legend-row">
+            <div style="width:14px;height:14px;display:flex;align-items:center;justify-content:center">
+              <div style="width:12px;height:12px;background:var(--choke);border-radius:50%;font-size:7px;color:white;display:flex;align-items:center;justify-content:center;font-weight:700">3</div>
+            </div>
+            CVE count badge
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+const ES_URL  = 'https://northfield-manufacturing-2bcb39.es.europe-west1.gcp.cloud.es.io';
+const API_KEY = 'a0xYM2pwd0Jmc2VZekQ4TWl6QjE6TjMtMEFYWXBQR2trRXNMdy1reGkzZw==';
+
+const NCOL = { critical:'#ff4444', high:'#f5a623', medium:'#3fb950', low:'#58a6ff' };
+const ECOL = { lateral_movement:'#ff4444', credential_access:'#f5a623', data_access:'#3fb950', exfiltration:'#bc8cff' };
+const NSIZ = { critical:22, high:17, medium:13, low:11 };
+const CHOKE_COL = '#bc8cff';
+
+let allNodes=[], allEdges=[], chokeIds=new Set();
+let activeFilter='all', showChoke=false;
+let svgEl, gEl, zoom, linkSel, nodeSel, simRef;
+let simNodes=[], simEdges=[];
+let selectedNode=null;
+let layoutDone=false;
+
+// ── FETCH ──────────────────────────────────────────────
+async function esQuery(query) {
+  const r = await fetch(`${ES_URL}/northfield-attack-graph/_search`, {
+    method:'POST',
+    headers:{ 'Content-Type':'application/json', 'Authorization':`ApiKey ${API_KEY}` },
+    body: JSON.stringify({ size:200, query })
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return (await r.json()).hits.hits.map(h=>h._source);
+}
+
+// ── METADATA FETCH ─────────────────────────────────────
+async function fetchMetadata() {
+  try {
+    const r = await fetch(`${ES_URL}/northfield-attack-graph/_doc/metadata`, {
+      headers:{ 'Authorization':`ApiKey ${API_KEY}` }
+    });
+    if (!r.ok) return null;
+    return (await r.json())._source;
+  } catch(e) { return null; }
+}
+
+function renderNarrative(meta) {
+  if (!meta) return;
+
+  // Update title
+  const titleEl = document.getElementById('narrative-title');
+  if (titleEl) titleEl.textContent = meta.title || 'Attack Path Analysis';
+
+  // Render question + narrative as readable text in narrative-sub
+  const subEl = document.getElementById('narrative-sub');
+  if (subEl) {
+    const q = meta.question ? `Q: ${meta.question}` : '';
+    subEl.textContent = q;
+  }
+
+  // Replace hardcoded kill chain phases with dynamic narrative
+  const tabNarrative = document.getElementById('tab-narrative');
+  if (!tabNarrative || !meta.narrative) return;
+
+  // Remove existing hardcoded phases
+  const existingPhases = tabNarrative.querySelectorAll('.attack-phase');
+  existingPhases.forEach(p => p.remove());
+
+  // Convert markdown narrative to readable HTML panels
+  const narrative = meta.narrative;
+  const sections = narrative.split(/\n(?=#{1,3} |\*\*[A-Z])/);
+
+  const container = document.createElement('div');
+  container.style.cssText = 'padding: 12px 16px; overflow-y: auto; max-height: calc(100vh - 280px);';
+
+  // Render as styled markdown-ish blocks
+  const html = narrative
+    .replace(/^#{1,3} (.+)$/gm, '<div style="font-size:13px;font-weight:700;color:#e6edf3;margin:16px 0 6px;border-bottom:1px solid #30363d;padding-bottom:4px;">$1</div>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong style="color:#e6edf3;">$1</strong>')
+    .replace(/^[-•] (.+)$/gm, '<div style="font-size:12px;color:#8b949e;padding:3px 0 3px 12px;border-left:2px solid #30363d;margin:2px 0;">$1</div>')
+    .replace(/\| (.+) \|/g, '') // strip tables
+    .replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid #21262d;margin:8px 0;">')
+    .replace(/\n\n/g, '<div style="height:6px;"></div>')
+    .replace(/\n/g, ' ');
+
+  container.innerHTML = `<div style="font-size:12px;line-height:1.6;color:#8b949e;">${html}</div>`;
+
+  // Add updated timestamp
+  if (meta.updated_at) {
+    const ts = document.createElement('div');
+    ts.style.cssText = 'font-size:10px;color:#484f58;margin-top:12px;padding-top:8px;border-top:1px solid #21262d;';
+    ts.textContent = `Analysis updated: ${new Date(meta.updated_at).toLocaleString()}`;
+    container.appendChild(ts);
+  }
+
+  tabNarrative.appendChild(container);
+}
+
+// ── INIT ───────────────────────────────────────────────
+async function init() {
+  try {
+    const [nodes, edges, meta] = await Promise.all([
+      esQuery({ term:{ type:'node' } }),
+      esQuery({ term:{ type:'edge' } }),
+      fetchMetadata()
+    ]);
+    allNodes = nodes;
+    allEdges = edges;
+
+    renderNarrative(meta);
+
+    // Choke point detection
+    const deg={};
+    allEdges.forEach(e=>{
+      deg[e.source_id]=(deg[e.source_id]||0)+1;
+      deg[e.target_id]=(deg[e.target_id]||0)+1;
+    });
+    chokeIds = new Set(Object.entries(deg).filter(([,c])=>c>=3).map(([id])=>id));
+
+    document.getElementById('loading').style.display='none';
+    document.getElementById('live-dot').classList.remove('error');
+    document.getElementById('live-text').textContent='Live';
+    document.getElementById('header-time').textContent=new Date().toLocaleTimeString();
+
+    buildGraph();
+    setupUI();
+  } catch(e) {
+    document.getElementById('loading').style.display='none';
+    document.getElementById('error-screen').style.display='flex';
+    document.getElementById('err-msg').textContent=`${e.message} — check Elasticsearch connectivity`;
+    document.getElementById('live-dot').classList.add('error');
+    document.getElementById('live-text').textContent='Error';
+  }
+}
+
+// ── NODE ICON SVG ──────────────────────────────────────
+function nodeIcon(t) {
+  switch(t) {
+    case 'workstation':
+      return `<rect x="-9" y="-6" width="18" height="11" rx="1.5" fill="currentColor"/>
+              <line x1="0" y1="5" x2="0" y2="8" stroke="currentColor" stroke-width="1.5"/>
+              <line x1="-4" y1="8" x2="4" y2="8" stroke="currentColor" stroke-width="1.5"/>
+              <rect x="-7" y="-4" width="14" height="7" rx="0.5" fill="black" opacity="0.2"/>`;
+    case 'server':
+      return `<rect x="-8" y="-9" width="16" height="18" rx="1.5" fill="currentColor"/>
+              <line x1="-5" y1="-4" x2="5" y2="-4" stroke="white" stroke-width="1" opacity="0.4"/>
+              <line x1="-5" y1="0" x2="5" y2="0" stroke="white" stroke-width="1" opacity="0.4"/>
+              <line x1="-5" y1="4" x2="3" y2="4" stroke="white" stroke-width="1" opacity="0.4"/>
+              <circle cx="5" cy="-4" r="1" fill="white" opacity="0.6"/>
+              <circle cx="5" cy="0" r="1" fill="white" opacity="0.6"/>`;
+    case 'domain_controller':
+      return `<polygon points="0,-11 10,-5.5 10,5.5 0,11 -10,5.5 -10,-5.5" fill="currentColor"/>
+              <text y="4" text-anchor="middle" font-size="7" font-weight="800" fill="white" font-family="IBM Plex Mono,monospace">DC</text>`;
+    default:
+      return `<circle r="9" fill="currentColor"/>
+              <ellipse cx="0" cy="0" rx="9" ry="5" fill="none" stroke="white" stroke-width="1" opacity="0.35"/>
+              <line x1="-9" y1="0" x2="9" y2="0" stroke="white" stroke-width="1" opacity="0.35"/>`;
+  }
+}
+
+// ── BUILD GRAPH ─────────────────────────────────────────
+function buildGraph() {
+  layoutDone = false;
+  const cont = document.getElementById('graph');
+  const W = cont.clientWidth, H = cont.clientHeight;
+
+  svgEl = d3.select('#svg');
+  svgEl.selectAll('g.root').remove();
+  gEl = svgEl.append('g').attr('class','root');
+
+  zoom = d3.zoom()
+    .scaleExtent([0.1, 5])
+    .on('zoom', e => gEl.attr('transform', e.transform));
+  svgEl.call(zoom).on('dblclick.zoom', null);
+
+  // Arrow markers
+  const defs = svgEl.select('defs');
+  defs.selectAll('marker').remove();
+  Object.entries(ECOL).forEach(([type, col]) => {
+    defs.append('marker')
+      .attr('id',`arr-${type}`)
+      .attr('viewBox','0 -4 8 8').attr('refX',26).attr('refY',0)
+      .attr('markerWidth',5).attr('markerHeight',5).attr('orient','auto')
+      .append('path').attr('d','M0,-4L8,0L0,4').attr('fill',col).attr('opacity',0.8);
+  });
+
+  const nodeMap={};
+  allNodes.forEach(n=>nodeMap[n.node_id]=n);
+
+  // Seed positions in a circle — prevents initial explosion
+  const angleStep = (2*Math.PI)/Math.max(allNodes.length,1);
+  const seedR = Math.min(W,H) * 0.3;
+  simNodes = allNodes.map((n,i) => ({
+    ...n,
+    id: n.node_id,
+    x: W/2 + seedR * Math.cos(i*angleStep),
+    y: H/2 + seedR * Math.sin(i*angleStep)
+  }));
+
+  const edgesToShow = activeFilter==='all' ? allEdges : allEdges.filter(e=>e.edge_type===activeFilter);
+  simEdges = edgesToShow
+    .filter(e=>nodeMap[e.source_id]&&nodeMap[e.target_id])
+    .map(e=>({...e, source:e.source_id, target:e.target_id}));
+
+  // Simulation — tighter settings to stop flying
+  if (simRef) simRef.stop();
+  simRef = d3.forceSimulation(simNodes)
+    .force('link', d3.forceLink(simEdges).id(d=>d.id).distance(160).strength(0.4))
+    .force('charge', d3.forceManyBody().strength(-400).distanceMax(400))
+    .force('center', d3.forceCenter(W/2, H/2).strength(0.08))
+    .force('collide', d3.forceCollide(d=>(NSIZ[d.criticality]||13)+28).strength(0.7))
+    .alphaDecay(0.035)     // slower decay = more stable final layout
+    .velocityDecay(0.4);   // higher damping = less flying
+
+  // Edges
+  linkSel = gEl.append('g').selectAll('line')
+    .data(simEdges).enter().append('line')
+    .attr('class','edge-animated')
+    .attr('stroke', d=>ECOL[d.edge_type]||'#666')
+    .attr('stroke-width', 1.6)
+    .attr('stroke-opacity', 0.4)
+    .attr('marker-end', d=>`url(#arr-${d.edge_type})`);
+
+  // Nodes
+  nodeSel = gEl.append('g').selectAll('g.node-g')
+    .data(simNodes).enter().append('g').attr('class','node-g')
+    .call(d3.drag()
+      .on('start',(e,d)=>{ if(!e.active) simRef.alphaTarget(0.15).restart(); d.fx=d.x; d.fy=d.y; })
+      .on('drag', (e,d)=>{ d.fx=e.x; d.fy=e.y; })
+      .on('end',  (e,d)=>{ if(!e.active) simRef.alphaTarget(0); d.fx=null; d.fy=null; })
+    );
+
+  // Choke halo
+  nodeSel.filter(d=>showChoke&&chokeIds.has(d.node_id))
+    .append('circle').attr('r',d=>(NSIZ[d.criticality]||13)+12)
+    .attr('fill','none').attr('stroke',CHOKE_COL)
+    .attr('stroke-width',1.5).attr('stroke-dasharray','4,3').attr('opacity',0.5);
+
+  // Compromised ring
+  nodeSel.filter(d=>d.compromised)
+    .append('circle').attr('r',d=>(NSIZ[d.criticality]||13)+7)
+    .attr('fill','none').attr('stroke',NCOL.critical)
+    .attr('stroke-width',1.5).attr('stroke-dasharray','3,2').attr('opacity',0.5);
+
+  // Glow bg
+  nodeSel.append('circle').attr('class','glow')
+    .attr('r',d=>(NSIZ[d.criticality]||13)+4)
+    .attr('fill',d=>NCOL[d.criticality]||'#666')
+    .attr('opacity',0.1);
+
+  // Icon
+  nodeSel.append('g').attr('class','icon')
+    .attr('color',d=>NCOL[d.criticality]||'#666')
+    .html(d=>nodeIcon(d.node_type));
+
+  // CVE badge
+  const bG = nodeSel.filter(d=>d.vulnerabilities?.length>0)
+    .append('g').attr('class','badge-g')
+    .attr('transform',d=>`translate(${(NSIZ[d.criticality]||13)-1},${-(NSIZ[d.criticality]||13)+1})`);
+  bG.append('circle').attr('r',8).attr('fill',CHOKE_COL).attr('stroke','#161b22').attr('stroke-width',1.5);
+  bG.append('text').attr('text-anchor','middle').attr('dy',4)
+    .attr('font-size',8).attr('font-weight',700)
+    .attr('font-family','IBM Plex Mono,monospace').attr('fill','white')
+    .text(d=>d.vulnerabilities.length);
+
+  // Label
+  nodeSel.append('text').attr('class','node-label')
+    .attr('dy',d=>(NSIZ[d.criticality]||13)+15)
+    .attr('text-anchor','middle')
+    .attr('fill','#8b949e')
+    .attr('font-family','IBM Plex Mono, monospace')
+    .attr('font-size',9).attr('font-weight',500)
+    .text(d=>d.label);
+
+  // Click
+  nodeSel.on('click',(e,d)=>{ e.stopPropagation(); selectNode(d); });
+  svgEl.on('click',()=>{ deselectNode(); });
+
+  // Tick
+  simRef.on('tick',()=>{
+    linkSel
+      .attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
+      .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
+    nodeSel.attr('transform',d=>`translate(${d.x},${d.y})`);
+  });
+
+  // Fit ONCE when simulation settles — not on every tick end
+  simRef.on('end',()=>{
+    if (!layoutDone) {
+      layoutDone = true;
+      fitView(600);
+    }
+  });
+}
+
+// ── FIT VIEW ────────────────────────────────────────────
+function fitView(duration=400) {
+  if (!simNodes||simNodes.length===0) return;
+  const c = document.getElementById('graph');
+  const W=c.clientWidth, H=c.clientHeight;
+  let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+  simNodes.forEach(d=>{
+    const r=(NSIZ[d.criticality]||13)+28;
+    x0=Math.min(x0,(d.x||0)-r); y0=Math.min(y0,(d.y||0)-r);
+    x1=Math.max(x1,(d.x||0)+r); y1=Math.max(y1,(d.y||0)+r);
+  });
+  const bw=x1-x0||1, bh=y1-y0||1, pad=48;
+  const scale=Math.min(0.92,(W-pad)/bw,(H-pad)/bh);
+  const tx=W/2-scale*(x0+bw/2);
+  const ty=H/2-scale*(y0+bh/2);
+  svgEl.transition().duration(duration)
+    .call(zoom.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
+}
+
+// ── NODE SELECTION ─────────────────────────────────────
+function selectNode(d) {
+  selectedNode = d;
+
+  // Activate node detail tab
+  switchTab('node');
+
+  // Highlight blast radius
+  const conn=new Set([d.node_id]);
+  simEdges.forEach(e=>{
+    const s=typeof e.source==='object'?e.source.id:e.source;
+    const t=typeof e.target==='object'?e.target.id:e.target;
+    if(s===d.node_id) conn.add(t);
+    if(t===d.node_id) conn.add(s);
+  });
+
+  nodeSel.select('g.icon').attr('opacity',n=>conn.has(n.node_id)?1:0.12);
+  nodeSel.select('circle.glow').attr('opacity',n=>conn.has(n.node_id)?0.15:0.02);
+  nodeSel.select('text.node-label').attr('opacity',n=>conn.has(n.node_id)?1:0.12);
+  nodeSel.select('g.badge-g').attr('opacity',n=>conn.has(n.node_id)?1:0.12);
+
+  linkSel
+    .attr('stroke-opacity',e=>{
+      const s=typeof e.source==='object'?e.source.id:e.source;
+      const t=typeof e.target==='object'?e.target.id:e.target;
+      return (s===d.node_id||t===d.node_id)?0.9:0.04;
+    })
+    .attr('stroke-width',e=>{
+      const s=typeof e.source==='object'?e.source.id:e.source;
+      const t=typeof e.target==='object'?e.target.id:e.target;
+      return (s===d.node_id||t===d.node_id)?2.5:1.6;
+    });
+
+  // Populate detail panel
+  document.getElementById('detail-empty').style.display='none';
+  document.getElementById('detail-content').style.display='block';
+  document.getElementById('d-name').textContent=d.label;
+  document.getElementById('d-type').textContent=d.node_type.replace(/_/g,' ').toUpperCase();
+  document.getElementById('d-dept').textContent=d.department||'—';
+  document.getElementById('d-owner').textContent=d.owner||'—';
+  document.getElementById('d-ip').textContent=d.ip||'—';
+
+  const crit=document.getElementById('d-crit');
+  crit.textContent=d.criticality; crit.className=`badge ${d.criticality}`;
+
+  const comp=document.getElementById('d-comp');
+  comp.textContent=d.compromised?'YES':'NO'; comp.className=`badge ${d.compromised?'yes':'no'}`;
+
+  document.getElementById('d-choke-row').style.display=chokeIds.has(d.node_id)?'flex':'none';
+
+  // Connections
+  const connItems=[];
+  simEdges.forEach(e=>{
+    const s=typeof e.source==='object'?e.source:simNodes.find(n=>n.id===e.source);
+    const t=typeof e.target==='object'?e.target:simNodes.find(n=>n.id===e.target);
+    if(!s||!t) return;
+    if(s.id===d.node_id) connItems.push({dir:'→',node:t,type:e.edge_type,eRef:e});
+    else if(t.id===d.node_id) connItems.push({dir:'←',node:s,type:e.edge_type,eRef:e});
+  });
+
+  if(connItems.length>0){
+    document.getElementById('d-conn-section').style.display='block';
+    const list=document.getElementById('d-conn-list');
+    list.innerHTML='';
+    connItems.forEach(c=>{
+      const col=ECOL[c.type]||'#666';
+      const item=document.createElement('div');
+      item.className='conn-item';
+      item.innerHTML=`
+        <span class="conn-direction" style="color:${col}">${c.dir}</span>
+        <span class="conn-host">${c.node.label}</span>
+        <span class="conn-type" style="color:${col}">${c.type.replace(/_/g,' ')}</span>`;
+      item.onclick=()=>selectNode(c.node);
+      list.appendChild(item);
+    });
+  } else {
+    document.getElementById('d-conn-section').style.display='none';
+  }
+
+  // Vulnerabilities
+  if(d.vulnerabilities?.length){
+    document.getElementById('d-vuln-section').style.display='block';
+    document.getElementById('d-vuln-count').textContent=d.vulnerabilities.length;
+    const vl=document.getElementById('d-vuln-list');
+    vl.innerHTML='';
+    d.vulnerabilities.forEach(v=>{
+      vl.innerHTML+=`
+        <div class="cve-card ${v.severity}">
+          <div class="cve-header">
+            <a class="cve-id" href="https://nvd.nist.gov/vuln/detail/${v.cve}" target="_blank" rel="noopener">${v.cve} ↗</a>
+            <span class="cvss ${v.severity}">CVSS ${v.cvss}</span>
+          </div>
+          <div class="cve-desc">${v.description||''}</div>
+        </div>`;
+    });
+  } else {
+    document.getElementById('d-vuln-section').style.display='none';
+  }
+}
+
+function deselectNode() {
+  selectedNode=null;
+  if(nodeSel){
+    nodeSel.select('g.icon').attr('opacity',1);
+    nodeSel.select('circle.glow').attr('opacity',0.1);
+    nodeSel.select('text.node-label').attr('opacity',1);
+    nodeSel.select('g.badge-g').attr('opacity',1);
+  }
+  if(linkSel) linkSel.attr('stroke-opacity',0.4).attr('stroke-width',1.6);
+  document.getElementById('detail-empty').style.display='flex';
+  document.getElementById('detail-content').style.display='none';
+}
+
+// ── TAB SWITCHING ──────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.panel-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
+  document.querySelectorAll('.tab-content').forEach(c=>c.classList.toggle('active',c.id===`tab-${name}`));
+}
+
+// ── UI SETUP ───────────────────────────────────────────
+function setupUI() {
+  // Zoom controls
+  document.getElementById('btn-zoomin').onclick=()=>svgEl.transition().duration(200).call(zoom.scaleBy,1.3);
+  document.getElementById('btn-zoomout').onclick=()=>svgEl.transition().duration(200).call(zoom.scaleBy,0.77);
+  document.getElementById('btn-fit').onclick=()=>fitView(400);
+
+  // Filter buttons — rebuild graph but PRESERVE layout positions
+  document.querySelectorAll('.phase-btn').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      document.querySelectorAll('.phase-btn').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      activeFilter=btn.dataset.filter;
+      deselectNode();
+      rebuildEdgesOnly();
+    });
+  });
+
+  // Choke toggle
+  document.getElementById('choke-btn').addEventListener('click',function(){
+    showChoke=!showChoke;
+    this.classList.toggle('active',showChoke);
+    deselectNode();
+    rebuildEdgesOnly();
+  });
+
+  // Panel tabs
+  document.querySelectorAll('.panel-tab').forEach(tab=>{
+    tab.addEventListener('click',()=>switchTab(tab.dataset.tab));
+  });
+
+  // Attack phase accordions
+  document.querySelectorAll('.phase-header').forEach(h=>{
+    h.addEventListener('click',()=>{
+      h.closest('.attack-phase').classList.toggle('open');
+    });
+  });
+}
+
+// ── REBUILD EDGES ONLY (preserves node positions) ─────
+function rebuildEdgesOnly() {
+  const nodeMap={};
+  simNodes.forEach(n=>nodeMap[n.id]=n);
+
+  const edgesToShow=activeFilter==='all'?allEdges:allEdges.filter(e=>e.edge_type===activeFilter);
+  simEdges=edgesToShow
+    .filter(e=>nodeMap[e.source_id]&&nodeMap[e.target_id])
+    .map(e=>({...e,source:e.source_id,target:e.target_id}));
+
+  // Remove and redraw edges only — nodes stay put
+  gEl.select('g:first-child').remove();
+  const edgeG=gEl.insert('g','g:first-child');
+  linkSel=edgeG.selectAll('line')
+    .data(simEdges).enter().append('line')
+    .attr('class','edge-animated')
+    .attr('stroke',d=>ECOL[d.edge_type]||'#666')
+    .attr('stroke-width',1.6)
+    .attr('stroke-opacity',0.4)
+    .attr('marker-end',d=>`url(#arr-${d.edge_type})`);
+
+  // Update positions immediately from existing simNode positions
+  linkSel
+    .attr('x1',d=>{ const s=typeof d.source==='object'?d.source:simNodes.find(n=>n.id===d.source); return s?.x||0; })
+    .attr('y1',d=>{ const s=typeof d.source==='object'?d.source:simNodes.find(n=>n.id===d.source); return s?.y||0; })
+    .attr('x2',d=>{ const t=typeof d.target==='object'?d.target:simNodes.find(n=>n.id===d.target); return t?.x||0; })
+    .attr('y2',d=>{ const t=typeof d.target==='object'?d.target:simNodes.find(n=>n.id===d.target); return t?.y||0; });
+
+  // Gently restart sim with existing positions — no explosion
+  if(simRef){
+    simRef.force('link').links(simEdges);
+    simRef.alpha(0.1).restart();
+  }
+
+  // Update choke halos — redraw node decorators
+  nodeSel.selectAll('circle.choke-ring').remove();
+  if(showChoke){
+    nodeSel.filter(d=>chokeIds.has(d.node_id))
+      .insert('circle','g.icon')
+      .attr('class','choke-ring')
+      .attr('r',d=>(NSIZ[d.criticality]||13)+12)
+      .attr('fill','none').attr('stroke',CHOKE_COL)
+      .attr('stroke-width',1.5).attr('stroke-dasharray','4,3').attr('opacity',0.5);
+  }
+}
+
+init();
+</script>
+</body>
+</html>

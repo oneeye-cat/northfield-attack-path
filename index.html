@@ -619,6 +619,7 @@
   </button>
   <div class="phase-sep"></div>
   <button class="choke-btn" id="choke-btn">◈ Choke Points</button>
+  <button class="choke-btn" id="story-focus-btn" style="margin-left:8px;">◎ Story Focus</button>
 </div>
 
 <div class="main">
@@ -909,7 +910,7 @@
 // lives only in that Worker's encrypted secrets.
 //
 // Set this to your deployed Worker's URL after running `wrangler deploy`.
-const WORKER_URL = 'https://northfield-attack-path-proxy.peter-northfield.workers.dev';
+const WORKER_URL = 'https://northfield-attack-path-proxy.YOUR-SUBDOMAIN.workers.dev';
 
 const NCOL = { critical:'#ff4444', high:'#f5a623', medium:'#3fb950', low:'#58a6ff' };
 const ECOL = { lateral_movement:'#ff4444', credential_access:'#f5a623', data_access:'#3fb950', exfiltration:'#bc8cff' };
@@ -917,7 +918,7 @@ const NSIZ = { critical:22, high:17, medium:13, low:11 };
 const CHOKE_COL = '#bc8cff';
 
 let allNodes=[], allEdges=[], chokeIds=new Set();
-let activeFilter='all', showChoke=false;
+let activeFilter='all', showChoke=false, storyFocusMode=true;
 let svgEl, gEl, zoom, linkSel, nodeSel, simRef;
 let simNodes=[], simEdges=[];
 let selectedNode=null;
@@ -1143,6 +1144,12 @@ function buildGraph() {
   const nodeMap={};
   allNodes.forEach(n=>nodeMap[n.node_id]=n);
 
+  // Is the current narrative's story actually a subset of the whole graph?
+  // If nothing is flagged (e.g. no narrative doc yet, or curated-only view),
+  // there's nothing to spotlight — show everything at full brightness as
+  // before rather than dimming the entire graph to near-nothing.
+  const anyHighlighted = allNodes.some(n=>n.highlighted) && storyFocusMode;
+
   // Seed positions in a circle — prevents initial explosion
   const angleStep = (2*Math.PI)/Math.max(allNodes.length,1);
   const seedR = Math.min(W,H) * 0.3;
@@ -1171,10 +1178,10 @@ function buildGraph() {
   // Edges
   linkSel = gEl.append('g').selectAll('line')
     .data(simEdges).enter().append('line')
-    .attr('class','edge-animated')
+    .attr('class', d => d.highlighted ? 'edge-animated' : '')
     .attr('stroke', d=>ECOL[d.edge_type]||'#666')
-    .attr('stroke-width', 1.6)
-    .attr('stroke-opacity', 0.4)
+    .attr('stroke-width', d => d.highlighted ? 2.4 : 1.2)
+    .attr('stroke-opacity', d => d.highlighted ? 0.85 : (anyHighlighted ? 0.08 : 0.4))
     .attr('marker-end', d=>`url(#arr-${d.edge_type})`);
 
   // Nodes
@@ -1202,11 +1209,12 @@ function buildGraph() {
   nodeSel.append('circle').attr('class','glow')
     .attr('r',d=>(NSIZ[d.criticality]||13)+4)
     .attr('fill',d=>NCOL[d.criticality]||'#666')
-    .attr('opacity',0.1);
+    .attr('opacity',d => d.highlighted ? 0.28 : (anyHighlighted ? 0.02 : 0.1));
 
   // Icon
   nodeSel.append('g').attr('class','icon')
     .attr('color',d=>NCOL[d.criticality]||'#666')
+    .attr('opacity', d => anyHighlighted && !d.highlighted ? 0.15 : 1)
     .html(d=>nodeIcon(d.node_type));
 
   // CVE badge
@@ -1223,10 +1231,20 @@ function buildGraph() {
   nodeSel.append('text').attr('class','node-label')
     .attr('dy',d=>(NSIZ[d.criticality]||13)+15)
     .attr('text-anchor','middle')
-    .attr('fill','#8b949e')
+    .attr('fill',d => d.highlighted ? '#f0f6fc' : '#8b949e')
     .attr('font-family','IBM Plex Mono, monospace')
-    .attr('font-size',9).attr('font-weight',500)
+    .attr('font-size',9).attr('font-weight',d=>d.highlighted?700:500)
+    .attr('opacity', d => anyHighlighted && !d.highlighted ? 0.2 : 1)
     .text(d=>d.label);
+
+  // Highlighted-story ring — a distinct visual marker (separate from choke
+  // points / compromised rings above) so "this is part of the current
+  // analysis" reads clearly even before dimming is fully processed.
+  nodeSel.filter(d=>d.highlighted)
+    .insert('circle','circle.glow').attr('class','story-ring')
+    .attr('r',d=>(NSIZ[d.criticality]||13)+5)
+    .attr('fill','none').attr('stroke','#58a6ff')
+    .attr('stroke-width',2).attr('opacity',0.9);
 
   // Click
   nodeSel.on('click',(e,d)=>{ e.stopPropagation(); selectNode(d); });
@@ -1240,22 +1258,26 @@ function buildGraph() {
     nodeSel.attr('transform',d=>`translate(${d.x},${d.y})`);
   });
 
-  // Fit ONCE when simulation settles — not on every tick end
+  // Fit ONCE when simulation settles — focus on just the current story's
+  // nodes if there is one, so the analyst's eye lands on what matters
+  // instead of the whole accumulated graph.
   simRef.on('end',()=>{
     if (!layoutDone) {
       layoutDone = true;
-      fitView(600);
+      fitView(600, anyHighlighted);
     }
   });
 }
 
 // ── FIT VIEW ────────────────────────────────────────────
-function fitView(duration=400) {
+function fitView(duration=400, focusHighlightedOnly=false) {
   if (!simNodes||simNodes.length===0) return;
+  const targets = (focusHighlightedOnly ? simNodes.filter(d=>d.highlighted) : simNodes);
+  const nodesToFit = targets.length ? targets : simNodes; // never fit to an empty set
   const c = document.getElementById('graph');
   const W=c.clientWidth, H=c.clientHeight;
   let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
-  simNodes.forEach(d=>{
+  nodesToFit.forEach(d=>{
     const r=(NSIZ[d.criticality]||13)+28;
     x0=Math.min(x0,(d.x||0)-r); y0=Math.min(y0,(d.y||0)-r);
     x1=Math.max(x1,(d.x||0)+r); y1=Math.max(y1,(d.y||0)+r);
@@ -1416,6 +1438,19 @@ function setupUI() {
     deselectNode();
     rebuildEdgesOnly();
   });
+
+  // Story Focus toggle — dim everything except the current narrative's
+  // path, or show the full accumulated graph at even brightness.
+  const storyBtn = document.getElementById('story-focus-btn');
+  if (storyBtn) {
+    storyBtn.classList.toggle('active', storyFocusMode);
+    storyBtn.addEventListener('click', function(){
+      storyFocusMode = !storyFocusMode;
+      this.classList.toggle('active', storyFocusMode);
+      deselectNode();
+      buildGraph(); // full rebuild — opacity/sizing differs enough to need it, not just edge swap
+    });
+  }
 
   // Panel tabs
   document.querySelectorAll('.panel-tab').forEach(tab=>{

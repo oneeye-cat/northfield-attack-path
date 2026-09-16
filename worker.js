@@ -446,11 +446,13 @@ function json(body, status = 200) {
   });
 }
 
-async function esSearch(env, query, size = 500) {
+async function esSearch(env, query, size = 500, sort = null) {
+  const body = { size, query };
+  if (sort) body.sort = sort;
   const r = await fetch(`${env.ES_URL}/northfield-attack-graph/_search`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `ApiKey ${env.ES_API_KEY}` },
-    body: JSON.stringify({ size, query }),
+    body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return (await r.json()).hits.hits.map(h => h._source);
@@ -473,10 +475,20 @@ export default {
         // Same three-source merge as northfield-forge's server.js: curated
         // baseline, the real CMDB-driven graph.type-nested docs, and the
         // agent's latest free-text narrative — earlier sources win on overlap.
+        //
+        // match_all previously had no sort and a 500-doc cap — once the
+        // index grows past 500 (each CMDB-graph write can add 100+ docs on
+        // its own), Elasticsearch's default unsorted order gives no
+        // guarantee new documents are among the ones returned, so a fresh
+        // write could silently sit outside this window and never even be
+        // considered. Sorting by @timestamp desc (missing values pushed
+        // last) plus a much higher cap ensures the newest real writes are
+        // always included.
+        const recencySort = [{ '@timestamp': { order: 'desc', unmapped_type: 'date', missing: '_last' } }];
         const [curatedNodes, curatedEdges, allDocs] = await Promise.all([
           esSearch(env, { term: { type: 'node' } }),
           esSearch(env, { term: { type: 'edge' } }),
-          esSearch(env, { match_all: {} }),
+          esSearch(env, { match_all: {} }, 5000, recencySort),
         ]);
 
         const nodeMap = new Map(curatedNodes.map(n => [n.node_id, n]));
@@ -494,9 +506,21 @@ export default {
           .filter(d => d.message)
           .sort((a, b) => new Date(b['@timestamp']) - new Date(a['@timestamp']))[0];
         if (narrativeDoc) {
+          // Mark every node/edge belonging to the CURRENT narrative's story
+          // with highlighted:true — whether it's newly introduced or already
+          // existed from curated/CMDB data. This is what lets the client
+          // spotlight "the path this specific analysis is about" instead of
+          // treating the whole accumulated graph as one undifferentiated pile.
           const parsed = parseNarrativeToGraph(narrativeDoc.message);
-          parsed.nodes.forEach(n => { if (!nodeMap.has(n.node_id)) nodeMap.set(n.node_id, n); });
-          parsed.edges.forEach(e => { if (!edgeMap.has(edgeKey(e))) edgeMap.set(edgeKey(e), e); });
+          parsed.nodes.forEach(n => {
+            if (nodeMap.has(n.node_id)) nodeMap.get(n.node_id).highlighted = true;
+            else nodeMap.set(n.node_id, { ...n, highlighted: true });
+          });
+          parsed.edges.forEach(e => {
+            const k = edgeKey(e);
+            if (edgeMap.has(k)) edgeMap.get(k).highlighted = true;
+            else edgeMap.set(k, { ...e, highlighted: true });
+          });
         }
 
         return json({ nodes: [...nodeMap.values()], edges: [...edgeMap.values()] });

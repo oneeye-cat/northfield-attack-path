@@ -598,6 +598,7 @@
     <div class="live-dot" id="live-dot"></div>
     <span id="live-text">Connecting</span>
   </div>
+  <button class="ctrl-btn" id="btn-refresh" title="Refresh graph now" style="margin-left:8px; width:auto; padding:0 8px;">↻</button>
   <div class="header-time" id="header-time">—</div>
 </header>
 
@@ -629,6 +630,7 @@
     <div id="error-screen">
       <div class="err-title">Connection Failed</div>
       <div class="err-msg" id="err-msg"></div>
+      <button class="ctrl-btn" id="btn-retry" style="width:auto;padding:6px 16px;margin-top:14px;font-size:12px;font-weight:500;">Retry</button>
     </div>
     <svg id="svg">
       <defs>
@@ -899,8 +901,15 @@
 </div>
 
 <script>
-const ES_URL  = 'https://northfield-manufacturing-2bcb39.es.europe-west1.gcp.cloud.es.io';
-const API_KEY = 'a0xYM2pwd0Jmc2VZekQ4TWl6QjE6TjMtMEFYWXBQR2trRXNMdy1reGkzZw==';
+// No credentials here — this static page has no backend of its own, so any
+// credential embedded directly in this file is exposed to the entire public
+// internet (this repo is public) and to bots that continuously scan GitHub
+// for exactly this pattern. All Elasticsearch access goes through a
+// Cloudflare Worker instead (worker.js in this repo) — the real API key
+// lives only in that Worker's encrypted secrets.
+//
+// Set this to your deployed Worker's URL after running `wrangler deploy`.
+const WORKER_URL = 'https://northfield-attack-path-proxy.peter-northfield.workers.dev';
 
 const NCOL = { critical:'#ff4444', high:'#f5a623', medium:'#3fb950', low:'#58a6ff' };
 const ECOL = { lateral_movement:'#ff4444', credential_access:'#f5a623', data_access:'#3fb950', exfiltration:'#bc8cff' };
@@ -913,26 +922,21 @@ let svgEl, gEl, zoom, linkSel, nodeSel, simRef;
 let simNodes=[], simEdges=[];
 let selectedNode=null;
 let layoutDone=false;
+let narrativePollTimer=null;
 
-// ── FETCH ──────────────────────────────────────────────
-async function esQuery(query) {
-  const r = await fetch(`${ES_URL}/northfield-attack-graph/_search`, {
-    method:'POST',
-    headers:{ 'Content-Type':'application/json', 'Authorization':`ApiKey ${API_KEY}` },
-    body: JSON.stringify({ size:200, query })
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()).hits.hits.map(h=>h._source);
+// ── FETCH — via the Worker proxy, not directly against Elasticsearch ──
+async function fetchGraphData() {
+  const r = await fetch(`${WORKER_URL}/attack-graph`);
+  const body = await r.json();
+  if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+  return body; // { nodes, edges }
 }
 
-// ── METADATA FETCH ─────────────────────────────────────
 async function fetchMetadata() {
   try {
-    const r = await fetch(`${ES_URL}/northfield-attack-graph/_doc/metadata`, {
-      headers:{ 'Authorization':`ApiKey ${API_KEY}` }
-    });
+    const r = await fetch(`${WORKER_URL}/attack-graph/metadata`);
     if (!r.ok) return null;
-    return (await r.json())._source;
+    return (await r.json()).meta;
   } catch(e) { return null; }
 }
 
@@ -1028,14 +1032,15 @@ function renderNarrative(meta) {
 
 // ── INIT ───────────────────────────────────────────────
 async function init() {
+  document.getElementById('error-screen').style.display='none';
+  document.getElementById('loading').style.display='flex';
   try {
-    const [nodes, edges, meta] = await Promise.all([
-      esQuery({ term:{ type:'node' } }),
-      esQuery({ term:{ type:'edge' } }),
-      fetchMetadata()
+    const [graphData, meta] = await Promise.all([
+      fetchGraphData(),
+      fetchMetadata(),
     ]);
-    allNodes = nodes;
-    allEdges = edges;
+    allNodes = graphData.nodes;
+    allEdges = graphData.edges;
 
     renderNarrative(meta);
 
@@ -1054,13 +1059,34 @@ async function init() {
 
     buildGraph();
     setupUI();
+    startNarrativePolling();
   } catch(e) {
     document.getElementById('loading').style.display='none';
     document.getElementById('error-screen').style.display='flex';
-    document.getElementById('err-msg').textContent=`${e.message} — check Elasticsearch connectivity`;
+    document.getElementById('err-msg').textContent=`${e.message} — check the Worker is deployed and WORKER_URL is set correctly`;
     document.getElementById('live-dot').classList.add('error');
     document.getElementById('live-text').textContent='Error';
   }
+}
+
+// ── LIVE NARRATIVE POLLING ─────────────────────────────
+// Refreshes just the narrative + timestamp on an interval, without
+// resetting the graph's node positions (a full rebuild every 45s would be
+// visually jarring mid-investigation). Use the ↻ button for a full refresh.
+function startNarrativePolling() {
+  if (narrativePollTimer) clearInterval(narrativePollTimer);
+  narrativePollTimer = setInterval(async () => {
+    try {
+      const meta = await fetchMetadata();
+      renderNarrative(meta);
+      document.getElementById('header-time').textContent = new Date().toLocaleTimeString();
+      document.getElementById('live-dot').classList.remove('error');
+      document.getElementById('live-text').textContent = 'Live';
+    } catch(e) {
+      document.getElementById('live-dot').classList.add('error');
+      document.getElementById('live-text').textContent = 'Error';
+    }
+  }, 45000);
 }
 
 // ── NODE ICON SVG ──────────────────────────────────────
@@ -1368,6 +1394,10 @@ function setupUI() {
   document.getElementById('btn-zoomout').onclick=()=>svgEl.transition().duration(200).call(zoom.scaleBy,0.77);
   document.getElementById('btn-fit').onclick=()=>fitView(400);
 
+  // Manual full-graph refresh
+  const refreshBtn = document.getElementById('btn-refresh');
+  if (refreshBtn) refreshBtn.onclick = () => init();
+
   // Filter buttons — rebuild graph but PRESERVE layout positions
   document.querySelectorAll('.phase-btn').forEach(btn=>{
     btn.addEventListener('click',()=>{
@@ -1562,6 +1592,7 @@ function saveNarrativePDF() {
   setTimeout(() => { win.print(); }, 500);
 }
 
+document.getElementById('btn-retry')?.addEventListener('click', init);
 init();
 </script>
 </body>

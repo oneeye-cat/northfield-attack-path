@@ -38,6 +38,21 @@
 
   .story-section { margin-top:32px; border-top:1px solid var(--border); padding-top:20px; max-width:820px; }
   .story-section-label { font-size:12px; color:var(--text-dim); margin-bottom:14px; text-transform:uppercase; letter-spacing:0.05em; }
+  .badge.alerts { background:rgba(245,166,35,0.15); color:var(--high); cursor:pointer; border:none; }
+  .badge.alerts:hover { background:rgba(245,166,35,0.28); }
+
+  #alerts-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); align-items:center; justify-content:center; z-index:100; }
+  .alerts-popout { width:600px; max-height:70vh; overflow-y:auto; background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:20px; }
+  .alerts-popout-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+  .alerts-popout-head h3 { font-size:15px; color:var(--text-bright); }
+  .alert-row { border-bottom:1px solid var(--border); padding:10px 0; }
+  .alert-row:last-child { border-bottom:none; }
+  .alert-row-head { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+  .alert-rule { font-size:13px; font-weight:600; color:var(--text-bright); flex:1; }
+  .alert-time { font-size:11px; color:var(--text-dim); font-family:'IBM Plex Mono',monospace; }
+  .alert-reason { font-size:12px; color:var(--text-dim); margin-bottom:4px; }
+  .alert-link { font-size:12px; color:var(--accent); text-decoration:none; }
+  .alert-link:hover { text-decoration:underline; }
   .nh2 { font-size:15px; font-weight:600; color:var(--text-bright); margin:18px 0 8px; }
   .nh3 { font-size:13px; font-weight:600; color:var(--accent); margin:14px 0 6px; }
   .nli { font-size:13px; color:var(--text); line-height:1.6; padding:2px 0 2px 14px; border-left:2px solid var(--border); margin:2px 0; }
@@ -72,7 +87,8 @@
   .node-card .nc-label { font-size:13px; font-weight:600; color:var(--text-bright); font-family:'IBM Plex Mono',monospace; word-break:break-all; }
   .node-card .nc-sub { font-size:11px; color:var(--text-dim); margin-bottom:8px; }
   .node-card .nc-badges { display:flex; flex-wrap:wrap; gap:4px; }
-  .badge { font-size:10px; padding:2px 7px; border-radius:4px; font-weight:600; white-space:nowrap; }
+  .badge { font-size:10px; padding:2px 7px; border-radius:4px; font-weight:600; white-space:nowrap; text-decoration:none; display:inline-block; }
+  a.badge:hover { text-decoration:underline; }
   .badge.crit-critical { background:rgba(255,68,68,0.15); color:var(--critical); }
   .badge.crit-high { background:rgba(245,166,35,0.15); color:var(--high); }
   .badge.crit-medium { background:rgba(63,185,80,0.15); color:var(--medium); }
@@ -126,6 +142,16 @@
   </div>
 </main>
 
+<div id="alerts-overlay" onclick="if(event.target===this) closeAlertsPopout()">
+  <div class="alerts-popout">
+    <div class="alerts-popout-head">
+      <h3 id="alerts-popout-title"></h3>
+      <button class="ctrl-btn" onclick="closeAlertsPopout()">✕</button>
+    </div>
+    <div id="alerts-popout-body"></div>
+  </div>
+</div>
+
 <script>
 const WORKER_URL = 'https://northfield-attack-path-proxy.peter-northfield.workers.dev';
 
@@ -146,9 +172,12 @@ function nodeBadges(n) {
   badges.push(critBadge(n.criticality));
   if (n.cves && n.cves.length) {
     const top = n.cves[0];
-    badges.push(`<span class="badge cve">${top.id}${top.cvss != null ? ' · ' + top.cvss : ''}</span>`);
+    badges.push(`<a class="badge cve" href="https://nvd.nist.gov/vuln/detail/${encodeURIComponent(top.id)}" target="_blank" rel="noopener">${top.id}${top.cvss != null ? ' · ' + top.cvss : ''}</a>`);
   }
   if (n.monitoring_status === 'inventory_only') badges.push(`<span class="badge dim">no EDR</span>`);
+  if (n.alertCount14d > 0) {
+    badges.push(`<span class="badge alerts" data-host="${n.node_id}" onclick="openAlertsPopout('${n.node_id}')">⚠ ${n.alertCount14d} (14d)</span>`);
+  }
   return badges.join('');
 }
 
@@ -168,6 +197,37 @@ function nodeCardHtml(n, isGameOver) {
       <div class="nc-badges">${nodeBadges(n)}</div>
     </div>`;
 }
+
+// ── ALERTS POPOUT ──────────────────────────────────────
+async function openAlertsPopout(host) {
+  const overlay = document.getElementById('alerts-overlay');
+  const body = document.getElementById('alerts-popout-body');
+  document.getElementById('alerts-popout-title').textContent = `${host} — alerts, last 14 days`;
+  body.innerHTML = '<div style="color:var(--text-dim); font-size:13px;">Loading…</div>';
+  overlay.style.display = 'flex';
+  try {
+    const r = await fetch(`${WORKER_URL}/alerts?host=${encodeURIComponent(host)}&days=14`);
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    if (!data.alerts.length) {
+      body.innerHTML = '<div style="color:var(--text-dim); font-size:13px;">No alerts in this window.</div>';
+      return;
+    }
+    body.innerHTML = data.alerts.map(a => `
+      <div class="alert-row">
+        <div class="alert-row-head">
+          <span class="badge crit-${(a.severity||'medium').toLowerCase()}">${a.severity||'—'}</span>
+          <span class="alert-rule">${a.rule||'—'}</span>
+          <span class="alert-time">${a.timestamp ? new Date(a.timestamp).toLocaleString() : ''}</span>
+        </div>
+        <div class="alert-reason">${a.reason||''}</div>
+        ${a.url ? `<a href="${a.url}" target="_blank" rel="noopener" class="alert-link">Open in Kibana Security →</a>` : ''}
+      </div>`).join('');
+  } catch (e) {
+    body.innerHTML = `<div style="color:var(--critical); font-size:13px;">${e.message}</div>`;
+  }
+}
+function closeAlertsPopout() { document.getElementById('alerts-overlay').style.display = 'none'; }
 
 function renderChain(chain, gameOver) {
   const row = document.getElementById('chain-row');

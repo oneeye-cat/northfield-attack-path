@@ -420,7 +420,8 @@ function mapCriticality(c) {
 function mapCmdbNodeType(t) {
   const s = (t || '').toLowerCase();
   if (s.includes('domain controller')) return 'domain_controller';
-  if (s.includes('workstation') || s.includes('laptop')) return 'workstation';
+  if (s === 'user') return 'user';
+  if (s.includes('workstation') || s.includes('laptop') || s.includes('desktop')) return 'workstation';
   return 'server';
 }
 function mapMitreTacticToEdgeType(tactic) {
@@ -515,6 +516,11 @@ function parseMetaSummaryToGraph(doc) {
 function isGameOverNode(node) {
   if (!node) return false;
   if (node.node_type === 'domain_controller') return true;
+  // Hostname naming convention (NFLD-DC01, NFLD-DC02) as an independent
+  // check — the AI-supplied `type` field for these hosts has been observed
+  // to say plain "Server" rather than "Domain Controller", so relying on
+  // node_type alone misses them.
+  if (/^NFLD-DC\d+/i.test(node.node_id)) return true;
   if (node.criticality === 'critical' && /SQL|DB/i.test(node.node_id)) return true;
   return false;
 }
@@ -612,15 +618,61 @@ async function esSearch(env, query, size = 500, sort = null) {
   return esSearchIndex(env, 'northfield-attack-graph', query, size, sort);
 }
 async function esSearchIndex(env, index, query, size = 500, sort = null) {
-  const body = { size, query };
-  if (sort) body.sort = sort;
+  const data = await esRawSearch(env, index, { size, query, ...(sort ? { sort } : {}) });
+  return data.hits.hits.map(h => h._source);
+}
+async function esRawSearch(env, index, body) {
   const r = await fetch(`${env.ES_URL}/${index}/_search`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `ApiKey ${env.ES_API_KEY}` },
     body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return (await r.json()).hits.hits.map(h => h._source);
+  return r.json();
+}
+
+// 14-day rolling alert count per host, via a terms aggregation rather than
+// fetching hits — this index has at least 10,000 documents, so counting via
+// aggregation (not size:0-and-still-scanning-hits) is the only sane way to
+// do this cheaply.
+async function fetchAlertCounts(env, hostIds, days = 14) {
+  if (!hostIds.length) return {};
+  const body = {
+    size: 0,
+    query: { bool: { filter: [
+      { terms: { 'host.name.keyword': hostIds } },
+      { range: { '@timestamp': { gte: `now-${days}d` } } },
+    ] } },
+    aggs: { by_host: { terms: { field: 'host.name.keyword', size: 1000 } } },
+  };
+  const data = await esRawSearch(env, '.alerts-security.alerts-default', body);
+  const counts = {};
+  (data.aggregations?.by_host?.buckets || []).forEach(b => { counts[b.key] = b.doc_count; });
+  return counts;
+}
+
+// The actual alert list for one host, for the click-to-expand popout.
+// kibana.alert.url is a direct link into the real Kibana Security alert
+// view — surfaced as-is so the popout is a genuine jump-off point into the
+// real investigation UI, not just a read-only summary.
+async function fetchAlertList(env, host, days = 14, size = 50) {
+  const body = {
+    size,
+    sort: [{ '@timestamp': { order: 'desc' } }],
+    query: { bool: { filter: [
+      { term: { 'host.name.keyword': host } },
+      { range: { '@timestamp': { gte: `now-${days}d` } } },
+    ] } },
+  };
+  const data = await esRawSearch(env, '.alerts-security.alerts-default', body);
+  return (data.hits?.hits || []).map(h => ({
+    rule: h._source['kibana.alert.rule.name'],
+    severity: h._source['kibana.alert.severity'],
+    riskScore: h._source['kibana.alert.risk_score'],
+    reason: h._source['kibana.alert.reason'],
+    timestamp: h._source['@timestamp'],
+    url: h._source['kibana.alert.url'],
+  }));
 }
 
 export default {
@@ -638,14 +690,30 @@ export default {
     try {
       if (url.pathname === '/attack-graph') {
         // No merged/background view — the page shows ONLY the latest run's
-        // story. Priority: structured summary doc (richest, most reliable)
-        // > free-text narrative > raw CMDB-graph edges as a last resort.
-        const recencySort = [{ '@timestamp': { order: 'desc', unmapped_type: 'date', missing: '_last' } }];
-        const allDocs = await esSearch(env, { match_all: {} }, 5000, recencySort);
+        // story. "Latest" is decided by Elasticsearch's own server-assigned
+        // _seq_no (monotonic, reliable on this single-shard index) — NOT
+        // by the AI-supplied @timestamp field, which has been observed to
+        // sometimes be midnight-normalized (date-only, no real time) rather
+        // than a genuine timestamp. Relying on @timestamp for cross-type
+        // "which run is newest" comparison meant a stale summary doc with a
+        // real time-of-day could outrank a genuinely fresher run that
+        // happened to get a midnight-normalized one — exactly the bug that
+        // made a new run's data never appear. _seq_no order fixes that
+        // regardless of what the AI puts in @timestamp.
+        const seqNoSort = [{ '_seq_no': { order: 'desc' } }];
+        const allDocs = await esSearch(env, { match_all: {} }, 5000, seqNoSort);
 
-        const summaryDoc = allDocs.filter(d => d.document_type === 'attack_path_summary')[0];
+        let winnerType = null, winnerDoc = null;
+        for (const d of allDocs) {
+          if (d.document_type === 'attack_path_summary') { winnerType = 'summary'; winnerDoc = d; break; }
+          if (d.message) { winnerType = 'narrative'; winnerDoc = d; break; }
+          if (d.graph) { winnerType = 'cmdb'; winnerDoc = d; break; }
+        }
+        const summaryDoc = winnerType === 'summary' ? winnerDoc : null;
+        const narrativeForChainDoc = winnerType === 'narrative' ? winnerDoc : null;
+        // The full-text "attack story" section is independent of which type
+        // won the chain — still whichever message-doc is most recent overall.
         const narrativeDoc = allDocs.filter(d => d.message)[0];
-        const cmdbDocs = allDocs.filter(d => d.graph);
 
         let title = null, narrative = null, updatedAt = null;
         let chainSteps = [], blastRadiusIds = [], nodesById = new Map(), edgeType = 'data_access';
@@ -659,24 +727,29 @@ export default {
           title = summaryDoc.title || null;
           narrative = summaryDoc.description || null;
           updatedAt = summaryDoc['@timestamp'];
-        } else if (narrativeDoc) {
-          const parsed = parseNarrativeToGraph(narrativeDoc.message);
+        } else if (narrativeForChainDoc) {
+          const parsed = parseNarrativeToGraph(narrativeForChainDoc.message);
           // parseNarrativeToGraph returns a flat graph, not phase-ordered
           // steps — approximate a chain from node insertion order (still
           // reasonable, since that parser also builds nodes in the order
           // they're encountered in the text).
           chainSteps = parsed.nodes.map(n => [n.node_id]);
           parsed.nodes.forEach(n => nodesById.set(n.node_id, n));
-          title = deriveTitle(narrativeDoc.message);
+          title = deriveTitle(narrativeForChainDoc.message);
           narrative = null;
-          updatedAt = narrativeDoc['@timestamp'];
-        } else if (cmdbDocs.length) {
-          const latestTs = cmdbDocs.reduce((max, d) => Math.max(max, new Date(d['@timestamp'] || 0).getTime()), 0);
-          const latestBatch = cmdbDocs.filter(d => new Date(d['@timestamp'] || 0).getTime() === latestTs);
+          updatedAt = narrativeForChainDoc['@timestamp'];
+        } else if (winnerType === 'cmdb') {
+          // Group the whole run's batch by matching @timestamp — still
+          // valid WITHIN one run (a single execution writes all its docs
+          // with the same value, whatever its granularity), just not
+          // reliable for comparing ACROSS different runs, which is why
+          // _seq_no (not this) decided which run won above.
+          const latestTs = winnerDoc['@timestamp'];
+          const latestBatch = allDocs.filter(d => d.graph && d['@timestamp'] === latestTs);
           const parsed = parseCmdbGraphDocs(latestBatch);
           chainSteps = parsed.nodes.map(n => [n.node_id]);
           parsed.nodes.forEach(n => nodesById.set(n.node_id, n));
-          updatedAt = latestBatch[0]?.['@timestamp'] || null;
+          updatedAt = latestTs || null;
         } else {
           return json({ title: null, narrative: null, chain: [], blastRadius: [], gameOver: false, updated_at: null });
         }
@@ -697,21 +770,26 @@ export default {
         // live CMDB (owner/department/monitoring) and Qualys (IP/top CVEs)
         // data — confirmed field shapes, not guessed.
         const allIds = [...new Set([...effectiveChainSteps.flat(), ...effectiveBlastRadius])];
-        const enrichment = await enrichNodes(env, allIds).catch(() => ({}));
+        const [enrichment, alertCounts] = await Promise.all([
+          enrichNodes(env, allIds).catch(() => ({})),
+          fetchAlertCounts(env, allIds).catch(() => ({})),
+        ]);
 
         // The full agent narrative — independent of which doc drove the
-        // chain above. When a structured summary doc exists, its own
-        // "description" is only a sentence; the rich prose (CVE tables,
-        // firewall evidence, escalation contacts, remediation steps) lives
-        // in the separate free-text narrativeDoc, if one exists for this run.
+        // chain above, EXCEPT it must not be older than whatever drove the
+        // chain (by _seq_no position in the already-sorted allDocs), or a
+        // stale narrative from a previous run would show alongside a fresh
+        // chain from a run that didn't happen to write one — exactly the
+        // kind of mismatch a genuinely new run with no message doc would
+        // otherwise cause.
         let storyHtml = null;
-        if (narrativeDoc) {
+        if (narrativeDoc && winnerDoc && allDocs.indexOf(narrativeDoc) <= allDocs.indexOf(winnerDoc)) {
           storyHtml = renderNarrativeHtml(prepareNarrativeForDisplay(narrativeDoc.message));
         }
 
         const enrich = id => {
           const node = nodesById.get(id) || { node_id: id, label: id, node_type: classifyNodeType(id), criticality: 'medium' };
-          return { ...node, ...(enrichment[id] || {}) };
+          return { ...node, ...(enrichment[id] || {}), alertCount14d: alertCounts[id] || 0 };
         };
 
         const chain = effectiveChainSteps.map(step => step.map(enrich));
@@ -725,6 +803,14 @@ export default {
           updated_at: updatedAt,
           debug: enrichment._meta,
         });
+      }
+
+      if (url.pathname === '/alerts') {
+        const host = url.searchParams.get('host');
+        if (!host) return json({ error: 'Missing ?host= parameter' }, 400);
+        const days = parseInt(url.searchParams.get('days') || '14', 10);
+        const alerts = await fetchAlertList(env, host, days);
+        return json({ host, days, alerts });
       }
 
       return json({ error: 'Not found' }, 404);

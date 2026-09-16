@@ -744,8 +744,17 @@ export default {
           // with the same value, whatever its granularity), just not
           // reliable for comparing ACROSS different runs, which is why
           // _seq_no (not this) decided which run won above.
+          //
+          // allDocs is sorted by _seq_no DESCENDING (needed for the winner
+          // scan above) — but that means it's in REVERSE submission order.
+          // Feeding that straight into parseCmdbGraphDocs processes the
+          // LAST-written edge first, which can insert a downstream node
+          // (e.g. the domain controller) before the actual entry point,
+          // triggering "game over" at step 0 and truncating away the real
+          // path entirely. Reverse back to ascending (original submission /
+          // logical) order before parsing.
           const latestTs = winnerDoc['@timestamp'];
-          const latestBatch = allDocs.filter(d => d.graph && d['@timestamp'] === latestTs);
+          const latestBatch = allDocs.filter(d => d.graph && d['@timestamp'] === latestTs).reverse();
           const parsed = parseCmdbGraphDocs(latestBatch);
           chainSteps = parsed.nodes.map(n => [n.node_id]);
           parsed.nodes.forEach(n => nodesById.set(n.node_id, n));

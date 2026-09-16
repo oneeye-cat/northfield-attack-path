@@ -422,18 +422,26 @@ function parseCmdbGraphDocs(sources) {
 // with an explicit ORDERED attack_phases array, a named most_at_risk_user,
 // and structured blast_radius host lists. Far more reliable than parsing
 // free prose — when one exists, it's the authoritative signal for "this
-// run's story," overriding the cruder latest-edge-batch heuristic.
+// run's story."
+//
+// Returns { chainSteps, blastRadiusIds, nodesById, edgeType } rather than a
+// flat merged graph — the caller needs the chain's actual ORDER (to find
+// where a domain-controller/critical-SQL "game over" node first appears
+// and truncate everything after it) and the blast-radius set kept SEPARATE
+// (dropped entirely once game-over is reached, per how an analyst actually
+// reads this: past a DC or critical DB, enumerating what's technically
+// reachable next stops being the useful fact — the useful fact is that
+// it's over).
 function parseMetaSummaryToGraph(doc) {
-  const nodes = new Map();
-  const edges = [];
+  const nodesById = new Map();
   const knownUsers = new Set();
   if (doc.most_at_risk_user?.username) knownUsers.add(doc.most_at_risk_user.username);
   if (doc.co_priority_user?.username) knownUsers.add(doc.co_priority_user.username);
   (doc.escalation_contacts || []).forEach(c => { if (c.username) knownUsers.add(c.username); });
 
   const addNode = (id) => {
-    if (nodes.has(id)) return;
-    nodes.set(id, {
+    if (nodesById.has(id)) return;
+    nodesById.set(id, {
       type: 'node', node_id: id, label: id,
       node_type: knownUsers.has(id) ? 'user' : classifyNodeType(id),
       criticality: knownUsers.has(id) ? 'high' : inferCriticality(id, JSON.stringify(doc)),
@@ -447,30 +455,70 @@ function parseMetaSummaryToGraph(doc) {
   };
 
   const phases = doc.attack_phases || [];
-  let chain = phases.map(extractIdentifiers).filter(g => g.length);
-  chain.forEach(group => group.forEach(addNode));
+  let chainSteps = phases.map(extractIdentifiers).filter(g => g.length);
+  chainSteps.forEach(group => group.forEach(addNode));
 
   const edgeType = classifyEdgeType(doc.title || '', phases.join(' '));
-  for (let i = 0; i < chain.length - 1; i++) {
-    chain[i].forEach(src => chain[i + 1].forEach(dst => {
-      if (src !== dst) edges.push({ type: 'edge', source_id: src, target_id: dst, edge_type: edgeType });
-    }));
-  }
 
-  // Fan out from the last phase to any blast-radius hosts not already in the chain
-  const chainFlat = chain.flat();
-  const chainSet = new Set(chainFlat);
-  const lastAnchor = chainFlat[chainFlat.length - 1];
-  if (lastAnchor) {
-    const br = doc.blast_radius || {};
-    const targets = [...(br.finance_servers || []), ...(br.it_servers || []), ...(br.domain_controllers || [])];
-    targets.forEach(h => {
-      addNode(h);
-      if (!chainSet.has(h)) edges.push({ type: 'edge', source_id: lastAnchor, target_id: h, edge_type: 'data_access' });
+  const br = doc.blast_radius || {};
+  const blastRadiusIds = [...(br.finance_servers || []), ...(br.it_servers || []), ...(br.domain_controllers || [])];
+  blastRadiusIds.forEach(addNode);
+
+  return { chainSteps, blastRadiusIds, nodesById, edgeType };
+}
+
+// A domain controller, or a server explicitly named as a critical SQL/DB
+// asset, is treated as "game over" — past this point the specific list of
+// what else is technically reachable stops being the useful fact.
+function isGameOverNode(node) {
+  if (!node) return false;
+  if (node.node_type === 'domain_controller') return true;
+  if (node.criticality === 'critical' && /SQL|DB/i.test(node.node_id)) return true;
+  return false;
+}
+
+// Enriches a set of hostnames/identities with real data from the CMDB
+// (owner, department, monitoring status) and Qualys (IP, top CVEs) —
+// confirmed field shapes, not guessed. Identity nodes (usernames) are left
+// alone: they don't exist in either index, and whatever role/context the
+// summary doc itself already gave them is all we have for those.
+async function enrichNodes(env, ids) {
+  const hostIds = [...new Set(ids)].filter(id => /^NFLD-/.test(id));
+  if (!hostIds.length) return {};
+  const [cmdbHits, qualysHits] = await Promise.all([
+    esSearchIndex(env, 'northfield-cmdb', { terms: { 'asset.hostname': hostIds } }, hostIds.length).catch(() => []),
+    esSearchIndex(env, 'northfield-qualys-vulnerabilities', { terms: { 'host.name': hostIds } }, 2000).catch(() => []),
+  ]);
+  const enrichment = {};
+  cmdbHits.forEach(d => {
+    const h = d.asset?.hostname;
+    if (!h) return;
+    enrichment[h] = enrichment[h] || {};
+    enrichment[h].owner = d.northfield?.cmdb?.owner_username;
+    enrichment[h].department = d.organization?.department;
+    enrichment[h].monitoring_status = d.northfield?.cmdb?.monitoring_status;
+  });
+  qualysHits.forEach(d => {
+    const h = d.host?.name;
+    if (!h) return;
+    enrichment[h] = enrichment[h] || {};
+    if (!enrichment[h].ip && d.host?.ip?.length) enrichment[h].ip = d.host.ip[0];
+    enrichment[h].cves = enrichment[h].cves || [];
+    enrichment[h].cves.push({
+      id: d.vulnerability?.id,
+      cvss: d.vulnerability?.cvss?.v3_1?.base_score ?? d.vulnerability?.score?.base ?? null,
+      severity: d.vulnerability?.severity,
+      patch_available: d.qualys?.vulnerability?.patch_available,
+      times_found: d.qualys?.vulnerability?.times_found,
     });
-  }
-
-  return { nodes: [...nodes.values()], edges };
+  });
+  Object.values(enrichment).forEach(e => {
+    if (e.cves) {
+      e.cves.sort((a, b) => (b.cvss || 0) - (a.cvss || 0));
+      e.cves = e.cves.slice(0, 3); // top 3 by CVSS — a node card isn't a vulnerability report
+    }
+  });
+  return enrichment;
 }
 
 // ─── Cloudflare Worker entry point ──────────────────────────────────────
@@ -503,9 +551,12 @@ function json(body, status = 200) {
 }
 
 async function esSearch(env, query, size = 500, sort = null) {
+  return esSearchIndex(env, 'northfield-attack-graph', query, size, sort);
+}
+async function esSearchIndex(env, index, query, size = 500, sort = null) {
   const body = { size, query };
   if (sort) body.sort = sort;
-  const r = await fetch(`${env.ES_URL}/northfield-attack-graph/_search`, {
+  const r = await fetch(`${env.ES_URL}/${index}/_search`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `ApiKey ${env.ES_API_KEY}` },
     body: JSON.stringify(body),
@@ -528,121 +579,81 @@ export default {
 
     try {
       if (url.pathname === '/attack-graph') {
-        // Same three-source merge as northfield-forge's server.js: curated
-        // baseline, the real CMDB-driven graph.type-nested docs, and the
-        // agent's latest free-text narrative — earlier sources win on overlap.
-        //
-        // match_all previously had no sort and a 500-doc cap — once the
-        // index grows past 500 (each CMDB-graph write can add 100+ docs on
-        // its own), Elasticsearch's default unsorted order gives no
-        // guarantee new documents are among the ones returned, so a fresh
-        // write could silently sit outside this window and never even be
-        // considered. Sorting by @timestamp desc (missing values pushed
-        // last) plus a much higher cap ensures the newest real writes are
-        // always included.
+        // No merged/background view — the page shows ONLY the latest run's
+        // story. Priority: structured summary doc (richest, most reliable)
+        // > free-text narrative > raw CMDB-graph edges as a last resort.
         const recencySort = [{ '@timestamp': { order: 'desc', unmapped_type: 'date', missing: '_last' } }];
-        const [curatedNodes, curatedEdges, allDocs] = await Promise.all([
-          esSearch(env, { term: { type: 'node' } }),
-          esSearch(env, { term: { type: 'edge' } }),
-          esSearch(env, { match_all: {} }, 5000, recencySort),
-        ]);
+        const allDocs = await esSearch(env, { match_all: {} }, 5000, recencySort);
 
-        const nodeMap = new Map(curatedNodes.map(n => [n.node_id, n]));
-        const edgeKey = e => `${e.source_id}->${e.target_id}`;
-        const edgeMap = new Map(curatedEdges.map(e => [edgeKey(e), e]));
-
-        // CMDB-graph docs carry no per-run identifier of their own, but a
-        // single workflow execution writes all of its docs with the SAME
-        // @timestamp — so the most recent distinct @timestamp among them
-        // IS "this run's batch." Split into that batch (highlighted — the
-        // current story) vs everything older (background), rather than
-        // treating all CMDB-graph data as undifferentiated background
-        // regardless of how recently it was written.
+        const summaryDoc = allDocs.filter(d => d.document_type === 'attack_path_summary')[0];
+        const narrativeDoc = allDocs.filter(d => d.message)[0];
         const cmdbDocs = allDocs.filter(d => d.graph);
-        if (cmdbDocs.length) {
-          const latestTs = cmdbDocs.reduce((max, d) => {
-            const t = new Date(d['@timestamp'] || 0).getTime();
-            return t > max ? t : max;
-          }, 0);
-          const latestBatch = cmdbDocs.filter(d => new Date(d['@timestamp'] || 0).getTime() === latestTs);
-          const olderBatch = cmdbDocs.filter(d => new Date(d['@timestamp'] || 0).getTime() !== latestTs);
 
-          if (olderBatch.length) {
-            const parsedOld = parseCmdbGraphDocs(olderBatch);
-            parsedOld.nodes.forEach(n => { if (!nodeMap.has(n.node_id)) nodeMap.set(n.node_id, n); });
-            parsedOld.edges.forEach(e => { if (!edgeMap.has(edgeKey(e))) edgeMap.set(edgeKey(e), e); });
-          }
-          if (latestBatch.length) {
-            const parsedNew = parseCmdbGraphDocs(latestBatch);
-            parsedNew.nodes.forEach(n => {
-              if (nodeMap.has(n.node_id)) nodeMap.get(n.node_id).highlighted = true;
-              else nodeMap.set(n.node_id, { ...n, highlighted: true });
-            });
-            parsedNew.edges.forEach(e => {
-              const k = edgeKey(e);
-              if (edgeMap.has(k)) edgeMap.get(k).highlighted = true;
-              else edgeMap.set(k, { ...e, highlighted: true });
-            });
-          }
-        }
+        let title = null, narrative = null, updatedAt = null;
+        let chainSteps = [], blastRadiusIds = [], nodesById = new Map(), edgeType = 'data_access';
 
-        const narrativeDoc = allDocs
-          .filter(d => d.message)
-          .sort((a, b) => new Date(b['@timestamp']) - new Date(a['@timestamp']))[0];
-        if (narrativeDoc) {
-          // Mark every node/edge belonging to the CURRENT narrative's story
-          // with highlighted:true — whether it's newly introduced or already
-          // existed from curated/CMDB data. This is what lets the client
-          // spotlight "the path this specific analysis is about" instead of
-          // treating the whole accumulated graph as one undifferentiated pile.
-          const parsed = parseNarrativeToGraph(narrativeDoc.message);
-          parsed.nodes.forEach(n => {
-            if (nodeMap.has(n.node_id)) nodeMap.get(n.node_id).highlighted = true;
-            else nodeMap.set(n.node_id, { ...n, highlighted: true });
-          });
-          parsed.edges.forEach(e => {
-            const k = edgeKey(e);
-            if (edgeMap.has(k)) edgeMap.get(k).highlighted = true;
-            else edgeMap.set(k, { ...e, highlighted: true });
-          });
-        }
-
-        // Structured per-run summary doc — applied LAST so it takes final
-        // priority over the cruder latest-edge-batch heuristic above. This
-        // is the most reliable signal available for "this run's story"
-        // when it exists (explicit ordered phases, named at-risk user,
-        // structured blast radius) rather than a guess from prose or batch
-        // recency alone.
-        const summaryDoc = allDocs
-          .filter(d => d.document_type === 'attack_path_summary')
-          .sort((a, b) => new Date(b['@timestamp']) - new Date(a['@timestamp']))[0];
         if (summaryDoc) {
           const parsed = parseMetaSummaryToGraph(summaryDoc);
-          parsed.nodes.forEach(n => {
-            if (nodeMap.has(n.node_id)) nodeMap.get(n.node_id).highlighted = true;
-            else nodeMap.set(n.node_id, { ...n, highlighted: true });
-          });
-          parsed.edges.forEach(e => {
-            const k = edgeKey(e);
-            if (edgeMap.has(k)) edgeMap.get(k).highlighted = true;
-            else edgeMap.set(k, { ...e, highlighted: true });
-          });
+          chainSteps = parsed.chainSteps;
+          blastRadiusIds = parsed.blastRadiusIds;
+          nodesById = parsed.nodesById;
+          edgeType = parsed.edgeType;
+          title = summaryDoc.title || null;
+          narrative = summaryDoc.description || null;
+          updatedAt = summaryDoc['@timestamp'];
+        } else if (narrativeDoc) {
+          const parsed = parseNarrativeToGraph(narrativeDoc.message);
+          // parseNarrativeToGraph returns a flat graph, not phase-ordered
+          // steps — approximate a chain from node insertion order (still
+          // reasonable, since that parser also builds nodes in the order
+          // they're encountered in the text).
+          chainSteps = parsed.nodes.map(n => [n.node_id]);
+          parsed.nodes.forEach(n => nodesById.set(n.node_id, n));
+          title = deriveTitle(narrativeDoc.message);
+          narrative = null;
+          updatedAt = narrativeDoc['@timestamp'];
+        } else if (cmdbDocs.length) {
+          const latestTs = cmdbDocs.reduce((max, d) => Math.max(max, new Date(d['@timestamp'] || 0).getTime()), 0);
+          const latestBatch = cmdbDocs.filter(d => new Date(d['@timestamp'] || 0).getTime() === latestTs);
+          const parsed = parseCmdbGraphDocs(latestBatch);
+          chainSteps = parsed.nodes.map(n => [n.node_id]);
+          parsed.nodes.forEach(n => nodesById.set(n.node_id, n));
+          updatedAt = latestBatch[0]?.['@timestamp'] || null;
+        } else {
+          return json({ title: null, narrative: null, chain: [], blastRadius: [], gameOver: false, updated_at: null });
         }
 
-        return json({ nodes: [...nodeMap.values()], edges: [...edgeMap.values()] });
-      }
+        // "Game over" — once the chain reaches a domain controller or a
+        // critical SQL/DB server, stop enumerating what's technically
+        // reachable next. Truncate the chain right there and drop the
+        // blast-radius list entirely.
+        let gameOverAt = -1;
+        for (let i = 0; i < chainSteps.length; i++) {
+          if (chainSteps[i].some(id => isGameOverNode(nodesById.get(id)))) { gameOverAt = i; break; }
+        }
+        const gameOver = gameOverAt !== -1;
+        const effectiveChainSteps = gameOver ? chainSteps.slice(0, gameOverAt + 1) : chainSteps;
+        const effectiveBlastRadius = gameOver ? [] : blastRadiusIds;
 
-      if (url.pathname === '/attack-graph/metadata') {
-        const hits = await esSearch(env, { exists: { field: 'message' } }, 5);
-        const doc = hits.sort((a, b) => new Date(b['@timestamp']) - new Date(a['@timestamp']))[0];
-        if (!doc) return json({ meta: null });
+        // Enrich every real host in the final chain + blast radius with
+        // live CMDB (owner/department/monitoring) and Qualys (IP/top CVEs)
+        // data — confirmed field shapes, not guessed.
+        const allIds = [...new Set([...effectiveChainSteps.flat(), ...effectiveBlastRadius])];
+        const enrichment = await enrichNodes(env, allIds).catch(() => ({}));
+
+        const enrich = id => {
+          const node = nodesById.get(id) || { node_id: id, label: id, node_type: classifyNodeType(id), criticality: 'medium' };
+          return { ...node, ...(enrichment[id] || {}) };
+        };
+
+        const chain = effectiveChainSteps.map(step => step.map(enrich));
+        const blastRadius = effectiveBlastRadius.map(enrich);
+
         return json({
-          meta: {
-            title: deriveTitle(doc.message),
-            narrative: prepareNarrativeForDisplay(doc.message),
-            question: null,
-            updated_at: doc['@timestamp'],
-          },
+          title, narrative,
+          chain, blastRadius, gameOver,
+          edgeType,
+          updated_at: updatedAt,
         });
       }
 

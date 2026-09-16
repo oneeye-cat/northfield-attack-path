@@ -362,6 +362,48 @@ function deriveTitle(message) {
   return firstLine.replace(/[*_`#]/g, '').trim() || 'Attack Path Analysis';
 }
 
+// Converts the markdown-ish narrative text into an HTML string the client
+// can drop straight into innerHTML — headers, bold/code inline formatting,
+// tables, and bullet/numbered lines. Done server-side (plain string/regex
+// work, no DOM needed) since a Worker has no DOM to build this with anyway,
+// and it keeps the client dumb (just inserts the string).
+function inlineFormat(s) {
+  return s
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+function renderNarrativeHtml(markdown) {
+  const lines = markdown.split('\n');
+  const out = [];
+  let tableBuf = [];
+  const flushTable = () => {
+    if (!tableBuf.length) return;
+    const rows = tableBuf.filter(r => !/^\|[\s\-:|]+\|$/.test(r.trim()));
+    out.push('<table class="ntable">' + rows.map(r => {
+      const cells = r.trim().slice(1, -1).split('|').map(c => `<td>${inlineFormat(c.trim())}</td>`);
+      return `<tr>${cells.join('')}</tr>`;
+    }).join('') + '</table>');
+    tableBuf = [];
+  };
+  lines.forEach(raw => {
+    const line = raw.trimEnd();
+    const isTableRow = /^\|.*\|$/.test(line.trim());
+    if (isTableRow) { tableBuf.push(line); return; }
+    flushTable();
+    if (/^#\s+/.test(line)) return; // h1 already shown as the page title
+    if (/^##\s+/.test(line)) { out.push(`<div class="nh2">${inlineFormat(line.replace(/^##\s+/, ''))}</div>`); return; }
+    if (/^###\s+/.test(line)) { out.push(`<div class="nh3">${inlineFormat(line.replace(/^###\s+/, ''))}</div>`); return; }
+    if (/^---+$/.test(line.trim())) { out.push('<hr class="ndivider">'); return; }
+    if (/^[-*]\s+/.test(line.trim())) { out.push(`<div class="nli">${inlineFormat(line.trim().replace(/^[-*]\s+/, ''))}</div>`); return; }
+    if (/^\d+\.\s+/.test(line.trim())) { out.push(`<div class="nli numbered">${inlineFormat(line.trim())}</div>`); return; }
+    if (/^>\s*/.test(line.trim())) { out.push(`<div class="nli">${inlineFormat(line.trim().replace(/^>\s*/, ''))}</div>`); return; }
+    if (!line.trim()) { out.push('<div class="nspacer"></div>'); return; }
+    out.push(`<div class="nli">${inlineFormat(line.trim())}</div>`);
+  });
+  flushTable();
+  return out.join('');
+}
+
 // ── CMDB-driven attack-graph docs (graph.type nested, self-describing edges) ──
 // A genuine third document shape — produced by the actual attack-path-writer
 // workflow's own ai.prompt step, using real MITRE tactic names rather than
@@ -485,9 +527,21 @@ function isGameOverNode(node) {
 async function enrichNodes(env, ids) {
   const hostIds = [...new Set(ids)].filter(id => /^NFLD-/.test(id));
   if (!hostIds.length) return {};
+  // "terms" queries need an exact-match keyword field — asset.hostname /
+  // host.name are very likely mapped as analyzed text with an automatic
+  // .keyword sub-field (Elasticsearch's default for string values), so the
+  // bare field name silently matches nothing rather than erroring. Errors
+  // are surfaced via _meta instead of swallowed, so an empty enrichment
+  // result is distinguishable from "this genuinely has no data." _meta is
+  // kept OUT of the per-hostname object below — it's added only at the very
+  // end, after the per-hostname loop that touches every value in this
+  // object has already finished, so it can never be mistaken for a host.
+  const errors = [];
   const [cmdbHits, qualysHits] = await Promise.all([
-    esSearchIndex(env, 'northfield-cmdb', { terms: { 'asset.hostname': hostIds } }, hostIds.length).catch(() => []),
-    esSearchIndex(env, 'northfield-qualys-vulnerabilities', { terms: { 'host.name': hostIds } }, 2000).catch(() => []),
+    esSearchIndex(env, 'northfield-cmdb', { terms: { 'asset.hostname.keyword': hostIds } }, hostIds.length)
+      .catch(e => { errors.push(`cmdb: ${e.message}`); return []; }),
+    esSearchIndex(env, 'northfield-qualys-vulnerabilities', { terms: { 'host.name.keyword': hostIds } }, 2000)
+      .catch(e => { errors.push(`qualys: ${e.message}`); return []; }),
   ]);
   const enrichment = {};
   cmdbHits.forEach(d => {
@@ -518,6 +572,7 @@ async function enrichNodes(env, ids) {
       e.cves = e.cves.slice(0, 3); // top 3 by CVSS — a node card isn't a vulnerability report
     }
   });
+  enrichment._meta = { errors: errors.length ? errors : null, matched: { cmdb: cmdbHits.length, qualys: qualysHits.length } };
   return enrichment;
 }
 
@@ -546,7 +601,10 @@ function corsHeaders() {
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+    // no-store — a GET being cached (by the browser or Cloudflare's edge)
+    // was the likely cause of a stale error persisting after a fix had
+    // already been deployed; this response should always be fetched fresh.
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...corsHeaders() },
   });
 }
 
@@ -641,6 +699,16 @@ export default {
         const allIds = [...new Set([...effectiveChainSteps.flat(), ...effectiveBlastRadius])];
         const enrichment = await enrichNodes(env, allIds).catch(() => ({}));
 
+        // The full agent narrative — independent of which doc drove the
+        // chain above. When a structured summary doc exists, its own
+        // "description" is only a sentence; the rich prose (CVE tables,
+        // firewall evidence, escalation contacts, remediation steps) lives
+        // in the separate free-text narrativeDoc, if one exists for this run.
+        let storyHtml = null;
+        if (narrativeDoc) {
+          storyHtml = renderNarrativeHtml(prepareNarrativeForDisplay(narrativeDoc.message));
+        }
+
         const enrich = id => {
           const node = nodesById.get(id) || { node_id: id, label: id, node_type: classifyNodeType(id), criticality: 'medium' };
           return { ...node, ...(enrichment[id] || {}) };
@@ -653,13 +721,18 @@ export default {
           title, narrative,
           chain, blastRadius, gameOver,
           edgeType,
+          storyHtml,
           updated_at: updatedAt,
+          debug: enrichment._meta,
         });
       }
 
       return json({ error: 'Not found' }, 404);
     } catch (e) {
-      return json({ error: e.message }, 502);
+      // Include the stack's top frame so a future error says WHICH line
+      // failed, rather than needing another round of blind guessing.
+      const topFrame = (e.stack || '').split('\n')[1]?.trim() || '';
+      return json({ error: e.message, at: topFrame }, 502);
     }
   },
 };

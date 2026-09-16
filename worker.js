@@ -417,6 +417,62 @@ function parseCmdbGraphDocs(sources) {
   return { nodes: [...nodes.values()], edges };
 }
 
+// ── Structured per-run attack-path summary doc ──────────────────────────
+// A fourth real document shape: {document_type:'attack_path_summary', ...}
+// with an explicit ORDERED attack_phases array, a named most_at_risk_user,
+// and structured blast_radius host lists. Far more reliable than parsing
+// free prose — when one exists, it's the authoritative signal for "this
+// run's story," overriding the cruder latest-edge-batch heuristic.
+function parseMetaSummaryToGraph(doc) {
+  const nodes = new Map();
+  const edges = [];
+  const knownUsers = new Set();
+  if (doc.most_at_risk_user?.username) knownUsers.add(doc.most_at_risk_user.username);
+  if (doc.co_priority_user?.username) knownUsers.add(doc.co_priority_user.username);
+  (doc.escalation_contacts || []).forEach(c => { if (c.username) knownUsers.add(c.username); });
+
+  const addNode = (id) => {
+    if (nodes.has(id)) return;
+    nodes.set(id, {
+      type: 'node', node_id: id, label: id,
+      node_type: knownUsers.has(id) ? 'user' : classifyNodeType(id),
+      criticality: knownUsers.has(id) ? 'high' : inferCriticality(id, JSON.stringify(doc)),
+    });
+  };
+  const extractIdentifiers = (text) => {
+    const expanded = expandShorthandHostnames(text);
+    const hosts = expanded.match(HOSTNAME_RE) || [];
+    const users = [...knownUsers].filter(u => text.includes(u));
+    return [...new Set([...hosts, ...users])];
+  };
+
+  const phases = doc.attack_phases || [];
+  let chain = phases.map(extractIdentifiers).filter(g => g.length);
+  chain.forEach(group => group.forEach(addNode));
+
+  const edgeType = classifyEdgeType(doc.title || '', phases.join(' '));
+  for (let i = 0; i < chain.length - 1; i++) {
+    chain[i].forEach(src => chain[i + 1].forEach(dst => {
+      if (src !== dst) edges.push({ type: 'edge', source_id: src, target_id: dst, edge_type: edgeType });
+    }));
+  }
+
+  // Fan out from the last phase to any blast-radius hosts not already in the chain
+  const chainFlat = chain.flat();
+  const chainSet = new Set(chainFlat);
+  const lastAnchor = chainFlat[chainFlat.length - 1];
+  if (lastAnchor) {
+    const br = doc.blast_radius || {};
+    const targets = [...(br.finance_servers || []), ...(br.it_servers || []), ...(br.domain_controllers || [])];
+    targets.forEach(h => {
+      addNode(h);
+      if (!chainSet.has(h)) edges.push({ type: 'edge', source_id: lastAnchor, target_id: h, edge_type: 'data_access' });
+    });
+  }
+
+  return { nodes: [...nodes.values()], edges };
+}
+
 // ─── Cloudflare Worker entry point ──────────────────────────────────────
 // Proxies the two calls the static page needs (list of graph
 // nodes/edges, latest narrative) so the real Elasticsearch API key lives
@@ -495,11 +551,39 @@ export default {
         const edgeKey = e => `${e.source_id}->${e.target_id}`;
         const edgeMap = new Map(curatedEdges.map(e => [edgeKey(e), e]));
 
+        // CMDB-graph docs carry no per-run identifier of their own, but a
+        // single workflow execution writes all of its docs with the SAME
+        // @timestamp — so the most recent distinct @timestamp among them
+        // IS "this run's batch." Split into that batch (highlighted — the
+        // current story) vs everything older (background), rather than
+        // treating all CMDB-graph data as undifferentiated background
+        // regardless of how recently it was written.
         const cmdbDocs = allDocs.filter(d => d.graph);
         if (cmdbDocs.length) {
-          const parsed = parseCmdbGraphDocs(cmdbDocs);
-          parsed.nodes.forEach(n => { if (!nodeMap.has(n.node_id)) nodeMap.set(n.node_id, n); });
-          parsed.edges.forEach(e => { if (!edgeMap.has(edgeKey(e))) edgeMap.set(edgeKey(e), e); });
+          const latestTs = cmdbDocs.reduce((max, d) => {
+            const t = new Date(d['@timestamp'] || 0).getTime();
+            return t > max ? t : max;
+          }, 0);
+          const latestBatch = cmdbDocs.filter(d => new Date(d['@timestamp'] || 0).getTime() === latestTs);
+          const olderBatch = cmdbDocs.filter(d => new Date(d['@timestamp'] || 0).getTime() !== latestTs);
+
+          if (olderBatch.length) {
+            const parsedOld = parseCmdbGraphDocs(olderBatch);
+            parsedOld.nodes.forEach(n => { if (!nodeMap.has(n.node_id)) nodeMap.set(n.node_id, n); });
+            parsedOld.edges.forEach(e => { if (!edgeMap.has(edgeKey(e))) edgeMap.set(edgeKey(e), e); });
+          }
+          if (latestBatch.length) {
+            const parsedNew = parseCmdbGraphDocs(latestBatch);
+            parsedNew.nodes.forEach(n => {
+              if (nodeMap.has(n.node_id)) nodeMap.get(n.node_id).highlighted = true;
+              else nodeMap.set(n.node_id, { ...n, highlighted: true });
+            });
+            parsedNew.edges.forEach(e => {
+              const k = edgeKey(e);
+              if (edgeMap.has(k)) edgeMap.get(k).highlighted = true;
+              else edgeMap.set(k, { ...e, highlighted: true });
+            });
+          }
         }
 
         const narrativeDoc = allDocs
@@ -512,6 +596,28 @@ export default {
           // spotlight "the path this specific analysis is about" instead of
           // treating the whole accumulated graph as one undifferentiated pile.
           const parsed = parseNarrativeToGraph(narrativeDoc.message);
+          parsed.nodes.forEach(n => {
+            if (nodeMap.has(n.node_id)) nodeMap.get(n.node_id).highlighted = true;
+            else nodeMap.set(n.node_id, { ...n, highlighted: true });
+          });
+          parsed.edges.forEach(e => {
+            const k = edgeKey(e);
+            if (edgeMap.has(k)) edgeMap.get(k).highlighted = true;
+            else edgeMap.set(k, { ...e, highlighted: true });
+          });
+        }
+
+        // Structured per-run summary doc — applied LAST so it takes final
+        // priority over the cruder latest-edge-batch heuristic above. This
+        // is the most reliable signal available for "this run's story"
+        // when it exists (explicit ordered phases, named at-risk user,
+        // structured blast radius) rather than a guess from prose or batch
+        // recency alone.
+        const summaryDoc = allDocs
+          .filter(d => d.document_type === 'attack_path_summary')
+          .sort((a, b) => new Date(b['@timestamp']) - new Date(a['@timestamp']))[0];
+        if (summaryDoc) {
+          const parsed = parseMetaSummaryToGraph(summaryDoc);
           parsed.nodes.forEach(n => {
             if (nodeMap.has(n.node_id)) nodeMap.get(n.node_id).highlighted = true;
             else nodeMap.set(n.node_id, { ...n, highlighted: true });
